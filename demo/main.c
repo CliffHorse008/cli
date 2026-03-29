@@ -69,5 +69,6 @@ int main(int argc, char **argv) {
     }
 
     embcli_telnet_server_stop(&server);
+    embcli_deinit(&cli);
     return 0;
 }

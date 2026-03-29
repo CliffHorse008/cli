@@ -35,6 +35,11 @@ typedef struct embcli_telnet_client {
     int socket_fd;
 } embcli_telnet_client_t;
 
+/*
+ * Telnet 帧状态。
+ * CLI 会把 telnet 控制字节和用户输入文本分开处理，避免选项协商和子协商内容
+ * 混入行编辑器。
+ */
 typedef enum embcli_telnet_state {
     EMBCLI_TELNET_DATA = 0,
     EMBCLI_TELNET_IAC,
@@ -43,12 +48,19 @@ typedef enum embcli_telnet_state {
     EMBCLI_TELNET_SB_IAC
 } embcli_telnet_state_t;
 
+/* 仅跟踪最小范围的 ANSI 转义序列，用于方向键历史导航。 */
 typedef enum embcli_ansi_state {
     EMBCLI_ANSI_NONE = 0,
     EMBCLI_ANSI_ESC,
     EMBCLI_ANSI_CSI
 } embcli_ansi_state_t;
 
+/*
+ * 每个客户端各自拥有一份行编辑状态。
+ * - `line`: 当前可见的命令行内容
+ * - `scratch`: 浏览历史时暂存的未提交输入
+ * - `history`: 用紧凑数组实现的有界历史记录
+ */
 typedef struct embcli_telnet_editor {
     char line[EMBCLI_TELNET_LINE_MAX];
     size_t line_len;
@@ -60,6 +72,12 @@ typedef struct embcli_telnet_editor {
     embcli_ansi_state_t ansi_state;
 } embcli_telnet_editor_t;
 
+/*
+ * 补全结果会先收集到一个扁平数组里，之后再决定是：
+ * - 作为可替换候选列表渲染
+ * - 还是作为仅提示信息渲染
+ *   例如 UINT/STRING 这类不适合自动猜值的参数
+ */
 typedef struct embcli_completion_result {
     struct {
         const char *name;
@@ -106,6 +124,7 @@ static void embcli_telnet_send_negotiation(int socket_fd) {
 #endif
 }
 
+/* 用于在 telnet 连接上输出菜单/帮助/补全信息的便捷函数。 */
 static void embcli_telnet_send_text(int socket_fd, const char *text) {
     if (text == NULL) {
         return;
@@ -179,6 +198,7 @@ static void embcli_telnet_redraw_line(
     char prompt[128];
     char buffer[EMBCLI_TELNET_LINE_MAX + 192];
 
+    /* 每次重绘都完整重写 prompt+line，并清掉尾部残留字符。 */
     embcli_session_format_prompt(session, prompt, sizeof(prompt));
     snprintf(buffer, sizeof(buffer), "\r%s> %s\033[K", prompt, editor->line);
     embcli_telnet_send_text(socket_fd, buffer);
@@ -203,6 +223,7 @@ static void embcli_telnet_editor_add_history(
         return;
     }
 
+    /* 跳过连续重复命令，避免方向键浏览历史时价值过低。 */
     if (editor->history_count > 0 &&
         strcmp(editor->history[editor->history_count - 1], line) == 0) {
         return;
@@ -470,6 +491,12 @@ static void embcli_telnet_collect_arg_matches(
     char hint[EMBCLI_TELNET_USAGE_MAX];
     const embcli_arg_spec_t *spec = embcli_telnet_find_active_arg(command, arg_index);
 
+    /*
+     * 只对“可以安全猜测”的参数值做自动补全：
+     * - 固定枚举值
+     * - 预定义的 bool 别名表
+     * 其它参数类型则退化为提示信息，仍然给用户提供输入指引。
+     */
     if (spec == NULL) {
         return;
     }
@@ -665,6 +692,10 @@ static void embcli_telnet_editor_autocomplete(
     size_t prefix_len = 0;
     bool in_token = false;
 
+    /*
+     * 补全逻辑以 token 为单位工作。
+     * 先根据当前行尾判断光标正位于哪个 token，再按该 token 位置收集对应候选。
+     */
     if (editor->line_len == 0) {
         embcli_telnet_collect_completion_matches(session, 0, NULL, "", &result);
         embcli_telnet_print_completion_list(socket_fd, session, editor, &result);
@@ -815,6 +846,12 @@ static void *embcli_telnet_client_thread(void *arg) {
     embcli_session_init(&session, client->server->config.cli, embcli_telnet_session_write, &client->socket_fd);
     embcli_session_start(&session);
 
+    /*
+     * 客户端主循环按“行”工作：
+     * - 原始字节先经过 telnet/ANSI 状态机过滤
+     * - 可打印字符进入行编辑器
+     * - CR/LF 把当前逻辑行提交给 CLI 核心
+     */
     while (!session.close_requested) {
         unsigned char buffer[128];
         ssize_t received = recv(client->socket_fd, buffer, sizeof(buffer), 0);
@@ -969,6 +1006,10 @@ static void *embcli_telnet_accept_thread(void *arg) {
         timeout.tv_sec = 0;
         timeout.tv_usec = 200000;
 
+        /*
+         * 使用较短超时让停服响应更及时。
+         * 如果只依赖阻塞式 accept，会让 selftest 中的 stop/restart 路径很难稳定覆盖。
+         */
         int ready = select(server->listen_fd + 1, &readfds, NULL, NULL, &timeout);
         if (!server->running) {
             break;
@@ -1086,6 +1127,10 @@ static void embcli_telnet_wake_listener(embcli_telnet_server_t *server) {
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_port = htons(server->config.port);
+    /*
+     * 通过“连一下再立刻断开”即可唤醒 accept 线程，
+     * 这样 stop() 在对方阻塞于 select() 时也能稳定 join。
+     */
     if (inet_pton(AF_INET, host, &address.sin_addr) == 1) {
         (void)connect(socket_fd, (struct sockaddr *)&address, sizeof(address));
     }

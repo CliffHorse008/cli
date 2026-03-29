@@ -11,6 +11,10 @@ typedef struct led_state {
     bool blink;
 } led_state_t;
 
+/*
+ * demo 回调刻意只回显解析后的状态，
+ * 这样自动化 selftest 就能在不依赖真实硬件的前提下断言各项功能。
+ */
 static void cmd_version(
     embcli_session_t *session,
     const embcli_value_t *values,
@@ -114,6 +118,10 @@ void build_demo_cli(embcli_t *cli) {
     static embcli_command_t cmd_ip;
     static embcli_command_t cmd_reboot_now;
 
+    /*
+     * 这些对象保留为 static，以贴近嵌入式固件常见的内存布局。
+     * 但每次 build 都会重新 init，确保 selftest 能在同一进程里多次启停 demo server。
+     */
     embcli_init(cli, "board", "Embedded CLI demo over telnet");
     embcli_menu_init(&system_menu, "system", "system control and logging");
     embcli_menu_init(&network_menu, "network", "network configuration");

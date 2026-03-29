@@ -16,6 +16,7 @@ target_include_directories(embcli
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+target_compile_definitions(embcli PUBLIC _POSIX_C_SOURCE=200809L)
 
 find_package(Threads REQUIRED)
 target_link_libraries(embcli PUBLIC Threads::Threads)

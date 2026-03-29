@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -21,6 +22,10 @@
 #define DEMO_PORT 2423
 #define DEMO_FEATURE_MAX 32768
 #define DEMO_STRESS_CAPACITY(bytes_per_loop, loops) (((bytes_per_loop) * (loops)) + 8192U)
+#define DEMO_DYNAMIC_WRITERS 4
+#define DEMO_DYNAMIC_READERS 4
+#define DEMO_DYNAMIC_MENUS_PER_WRITER 16
+#define DEMO_DYNAMIC_TOTAL_MENUS (DEMO_DYNAMIC_WRITERS * DEMO_DYNAMIC_MENUS_PER_WRITER)
 
 typedef enum demo_telnet_state {
     DEMO_TELNET_DATA = 0,
@@ -41,6 +46,7 @@ typedef struct demo_filter_state {
     demo_ansi_state_t ansi;
 } demo_filter_state_t;
 
+/* 一个轻量测试桩对象，用于在进程内启动/停止 demo server。 */
 typedef struct demo_server_ctx {
     embcli_t cli;
     embcli_telnet_server_t server;
@@ -56,6 +62,55 @@ typedef struct stress_worker_args {
     char error[256];
 } stress_worker_args_t;
 
+typedef struct demo_mem_writer {
+    char *buffer;
+    size_t capacity;
+    size_t length;
+} demo_mem_writer_t;
+
+typedef struct demo_thread_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int total;
+    int ready;
+    bool open;
+    bool aborted;
+} demo_thread_gate_t;
+
+typedef struct dynamic_entry {
+    embcli_menu_t menu;
+    embcli_command_t command;
+    int command_id;
+    char menu_name[32];
+    char menu_summary[64];
+    char command_summary[64];
+} dynamic_entry_t;
+
+typedef struct dynamic_test_ctx {
+    embcli_t cli;
+    demo_thread_gate_t gate;
+    atomic_bool stop_readers;
+    dynamic_entry_t entries[DEMO_DYNAMIC_TOTAL_MENUS];
+} dynamic_test_ctx_t;
+
+typedef struct dynamic_writer_args {
+    dynamic_test_ctx_t *ctx;
+    int writer_id;
+    bool ok;
+    char error[128];
+} dynamic_writer_args_t;
+
+typedef struct dynamic_reader_args {
+    dynamic_test_ctx_t *ctx;
+    int reader_id;
+    bool ok;
+    char error[128];
+} dynamic_reader_args_t;
+
+/*
+ * selftest 会把 telnet 输出收敛成纯文本，
+ * 这样断言就可以基于稳定字符串，而不是依赖终端控制序列。
+ */
 static void demo_append_char(char *buffer, size_t capacity, size_t *length, char ch) {
     if (*length + 1 >= capacity) {
         return;
@@ -72,6 +127,10 @@ static void demo_filter_bytes(
     char *output,
     size_t output_capacity,
     size_t *output_len) {
+    /*
+     * 过滤掉 telnet 协商字节和 ANSI 重绘噪声。
+     * CLI 会频繁重画提示符，但测试只关心最终的语义文本。
+     */
     for (size_t index = 0; index < input_len; ++index) {
         unsigned char byte = input[index];
 
@@ -198,6 +257,10 @@ static ssize_t demo_recv_quiet(
         buffer[0] = '\0';
     }
 
+    /*
+     * 持续读取，直到连接在一个短暂窗口内安静下来。
+     * 这很适合 CLI 流量模型：每条命令都会产生一串输出，随后回到空闲 prompt。
+     */
     while (elapsed_ms < total_timeout_ms) {
         fd_set readfds;
         struct timeval tv;
@@ -258,6 +321,93 @@ static bool demo_expect_contains(const char *output, const char *needle, const c
     return true;
 }
 
+static void demo_mem_writer_reset(demo_mem_writer_t *writer) {
+    writer->length = 0;
+    if (writer->capacity > 0) {
+        writer->buffer[0] = '\0';
+    }
+}
+
+static void demo_mem_writer_write(void *ctx, const char *data, size_t len) {
+    demo_mem_writer_t *writer = (demo_mem_writer_t *)ctx;
+    size_t writable;
+
+    if (writer == NULL || writer->buffer == NULL || writer->capacity == 0 || data == NULL || len == 0) {
+        return;
+    }
+    if (writer->length >= writer->capacity - 1U) {
+        return;
+    }
+
+    writable = len;
+    if (writable > (writer->capacity - writer->length - 1U)) {
+        writable = writer->capacity - writer->length - 1U;
+    }
+
+    memcpy(writer->buffer + writer->length, data, writable);
+    writer->length += writable;
+    writer->buffer[writer->length] = '\0';
+}
+
+static bool demo_thread_gate_init(demo_thread_gate_t *gate, int total) {
+    if (pthread_mutex_init(&gate->mutex, NULL) != 0) {
+        return false;
+    }
+    if (pthread_cond_init(&gate->cond, NULL) != 0) {
+        pthread_mutex_destroy(&gate->mutex);
+        return false;
+    }
+    gate->total = total;
+    gate->ready = 0;
+    gate->open = false;
+    gate->aborted = false;
+    return true;
+}
+
+static void demo_thread_gate_destroy(demo_thread_gate_t *gate) {
+    pthread_cond_destroy(&gate->cond);
+    pthread_mutex_destroy(&gate->mutex);
+}
+
+static void demo_thread_gate_abort(demo_thread_gate_t *gate) {
+    pthread_mutex_lock(&gate->mutex);
+    gate->aborted = true;
+    gate->open = true;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static bool demo_thread_gate_wait(demo_thread_gate_t *gate) {
+    bool ok = true;
+
+    pthread_mutex_lock(&gate->mutex);
+    ++gate->ready;
+    if (gate->ready >= gate->total) {
+        gate->open = true;
+        pthread_cond_broadcast(&gate->cond);
+    }
+    while (!gate->open) {
+        pthread_cond_wait(&gate->cond, &gate->mutex);
+    }
+    if (gate->aborted) {
+        ok = false;
+    }
+    pthread_mutex_unlock(&gate->mutex);
+    return ok;
+}
+
+static void demo_dynamic_command(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    int *command_id = (int *)user_data;
+
+    (void)values;
+    (void)value_count;
+    embcli_session_printf(session, "dynamic command %d\r\n", *command_id);
+}
+
 static bool demo_open_session(uint16_t port, int *fd_out, char *buffer, size_t capacity) {
     int fd = demo_connect_client(port);
     char fallback[4096];
@@ -269,6 +419,10 @@ static bool demo_open_session(uint16_t port, int *fd_out, char *buffer, size_t c
         return false;
     }
 
+    /*
+     * 某些压测路径只需要一个可用 socket，并不关心 banner 内容。
+     * 用本地 fallback buffer 可以复用同一套建连逻辑。
+     */
     if (read_buffer == NULL || read_capacity == 0U) {
         read_buffer = fallback;
         read_capacity = sizeof(fallback);
@@ -319,6 +473,7 @@ static bool demo_start_server(demo_server_ctx_t *ctx, uint16_t port, int max_cli
 
 static void demo_stop_server(demo_server_ctx_t *ctx) {
     embcli_telnet_server_stop(&ctx->server);
+    embcli_deinit(&ctx->cli);
 }
 
 static bool test_banner_and_root(uint16_t port) {
@@ -415,6 +570,15 @@ static bool test_parameters_and_errors(uint16_t port) {
 static bool test_completion_and_history(uint16_t port) {
     int fd;
     char output[DEMO_FEATURE_MAX];
+    /*
+     * 这段混合脚本覆盖了：
+     * - 菜单补全
+     * - help 目标补全
+     * - 枚举值补全
+     * - 参数提示展示
+     * - 通过方向键回放历史
+     * - bool 参数补全
+     */
     static const char script[] =
         "sy\t\r"
         "help \t\r"
@@ -465,6 +629,7 @@ static bool run_feature_demo(uint16_t port) {
         { "completion-and-history", test_completion_and_history }
     };
 
+    /* 固定顺序执行功能测试，便于在失败时直接定位阶段。 */
     for (size_t index = 0; index < sizeof(tests) / sizeof(tests[0]); ++index) {
         bool ok = tests[index].fn(port);
         printf("[feature] %s: %s\n", tests[index].name, ok ? "PASS" : "FAIL");
@@ -485,6 +650,10 @@ static bool run_sequential_stress(uint16_t port, int loops) {
         return false;
     }
 
+    /*
+     * 顺序压测会维持一个长连接，并持续发送多轮命令突发流量。
+     * 这样能在没有多线程噪声的情况下，抓出菜单导航和行处理里的状态泄漏问题。
+     */
     for (int index = 0; index < loops; ++index) {
         int led_id = index % 8;
         int host_octet = (index % 200) + 10;
@@ -558,6 +727,7 @@ static void *run_stress_worker(void *arg) {
         return NULL;
     }
 
+    /* 每个 worker 都像一个独立操作者，拥有自己的会话。 */
     for (int index = 0; index < worker->loops; ++index) {
         int led_id = (worker->worker_id + index) % 8;
         snprintf(
@@ -633,6 +803,7 @@ static bool run_parallel_stress(uint16_t port, int clients, int loops) {
         return false;
     }
 
+    /* 并发 worker 主要用于验证 telnet 传输层的线程安全和隔离性。 */
     for (int index = 0; index < clients; ++index) {
         workers[index].port = port;
         workers[index].worker_id = index;
@@ -678,6 +849,7 @@ static bool run_saturation_test(uint16_t port) {
         return false;
     }
 
+    /* 第三个会话应被拒绝，因为这里把 max_clients 固定成了 2。 */
     printf("[saturation] open session #3 expecting busy\n");
     fflush(stdout);
     fd3 = demo_connect_client(port);
@@ -702,6 +874,244 @@ cleanup:
     if (!ok) {
         fprintf(stderr, "saturation test failed\n");
     }
+    return ok;
+}
+
+static void *run_dynamic_writer(void *arg) {
+    dynamic_writer_args_t *worker = (dynamic_writer_args_t *)arg;
+    dynamic_test_ctx_t *ctx = worker->ctx;
+    int begin = worker->writer_id * DEMO_DYNAMIC_MENUS_PER_WRITER;
+
+    worker->ok = false;
+    worker->error[0] = '\0';
+    if (!demo_thread_gate_wait(&ctx->gate)) {
+        snprintf(worker->error, sizeof(worker->error), "gate aborted");
+        return NULL;
+    }
+
+    /*
+     * 每个写线程负责一段互不重叠的菜单对象，避免对象级写冲突。
+     * 真正共享的是 CLI 树本身，从而可以验证动态尾插时的加锁正确性。
+     */
+    for (int index = 0; index < DEMO_DYNAMIC_MENUS_PER_WRITER; ++index) {
+        dynamic_entry_t *entry = &ctx->entries[begin + index];
+        struct timespec pause;
+
+        snprintf(entry->menu_name, sizeof(entry->menu_name), "dyn-%d-%02d", worker->writer_id, index);
+        snprintf(
+            entry->menu_summary,
+            sizeof(entry->menu_summary),
+            "dynamic menu from writer %d item %d",
+            worker->writer_id,
+            index);
+        snprintf(
+            entry->command_summary,
+            sizeof(entry->command_summary),
+            "dynamic ping from writer %d item %d",
+            worker->writer_id,
+            index);
+
+        entry->command_id = begin + index;
+        embcli_menu_init(&entry->menu, entry->menu_name, entry->menu_summary);
+        embcli_command_init(
+            &entry->command,
+            "ping",
+            entry->command_summary,
+            NULL,
+            0,
+            demo_dynamic_command,
+            &entry->command_id);
+
+        embcli_menu_add_menu(embcli_root_menu(&ctx->cli), &entry->menu);
+        embcli_menu_add_command(&entry->menu, &entry->command);
+
+        /*
+         * 人为插入极短让步，增加注册线程与查询线程交错的概率，
+         * 让测试更容易覆盖“菜单已挂接、命令刚追加”的边界窗口。
+         */
+        pause.tv_sec = 0;
+        pause.tv_nsec = 1000000L;
+        nanosleep(&pause, NULL);
+    }
+
+    worker->ok = true;
+    return NULL;
+}
+
+static void *run_dynamic_reader(void *arg) {
+    dynamic_reader_args_t *reader = (dynamic_reader_args_t *)arg;
+    dynamic_test_ctx_t *ctx = reader->ctx;
+    embcli_session_t session;
+    demo_mem_writer_t writer;
+    char output[8192];
+    char prompt[128];
+    int rounds = 0;
+
+    reader->ok = false;
+    reader->error[0] = '\0';
+
+    writer.buffer = output;
+    writer.capacity = sizeof(output);
+    demo_mem_writer_reset(&writer);
+    embcli_session_init(&session, &ctx->cli, demo_mem_writer_write, &writer);
+
+    if (!demo_thread_gate_wait(&ctx->gate)) {
+        snprintf(reader->error, sizeof(reader->error), "gate aborted");
+        return NULL;
+    }
+
+    while (!atomic_load(&ctx->stop_readers)) {
+        demo_mem_writer_reset(&writer);
+        embcli_session_show_current_menu(&session);
+        embcli_session_prompt(&session);
+        if (writer.length == 0 || strstr(output, "[dyncli]") == NULL) {
+            snprintf(reader->error, sizeof(reader->error), "menu listing failed at round %d", rounds);
+            return NULL;
+        }
+
+        demo_mem_writer_reset(&writer);
+        embcli_session_process_line(&session, "help");
+        if (writer.length == 0 || strstr(output, "help [name]") == NULL) {
+            snprintf(reader->error, sizeof(reader->error), "help failed at round %d", rounds);
+            return NULL;
+        }
+
+        memset(prompt, 0, sizeof(prompt));
+        embcli_session_format_prompt(&session, prompt, sizeof(prompt));
+        if (strcmp(prompt, "dyncli") != 0) {
+            snprintf(reader->error, sizeof(reader->error), "prompt mismatch at round %d: %.64s", rounds, prompt);
+            return NULL;
+        }
+
+        ++rounds;
+    }
+
+    reader->ok = true;
+    return NULL;
+}
+
+static bool verify_dynamic_registration(dynamic_test_ctx_t *ctx) {
+    embcli_session_t session;
+    demo_mem_writer_t writer;
+    char output[8192];
+    bool ok = true;
+
+    writer.buffer = output;
+    writer.capacity = sizeof(output);
+
+    for (int index = 0; index < DEMO_DYNAMIC_TOTAL_MENUS; ++index) {
+        dynamic_entry_t *entry = &ctx->entries[index];
+
+        demo_mem_writer_reset(&writer);
+        embcli_session_init(&session, &ctx->cli, demo_mem_writer_write, &writer);
+        embcli_session_process_line(&session, entry->menu_name);
+        if (strstr(output, "enter menu:") == NULL) {
+            fprintf(stderr, "dynamic verify failed when entering %s\noutput:\n%s\n", entry->menu_name, output);
+            ok = false;
+            break;
+        }
+
+        demo_mem_writer_reset(&writer);
+        embcli_session_process_line(&session, "help ping");
+        if (strstr(output, "command : ping") == NULL) {
+            fprintf(stderr, "dynamic verify failed for help %s\noutput:\n%s\n", entry->menu_name, output);
+            ok = false;
+            break;
+        }
+
+        demo_mem_writer_reset(&writer);
+        embcli_session_process_line(&session, "ping");
+        if (strstr(output, "dynamic command") == NULL) {
+            fprintf(stderr, "dynamic verify failed for ping %s\noutput:\n%s\n", entry->menu_name, output);
+            ok = false;
+            break;
+        }
+    }
+
+    return ok;
+}
+
+static bool run_dynamic_registration_test(void) {
+    dynamic_test_ctx_t ctx;
+    pthread_t writers[DEMO_DYNAMIC_WRITERS];
+    pthread_t readers[DEMO_DYNAMIC_READERS];
+    dynamic_writer_args_t writer_args[DEMO_DYNAMIC_WRITERS];
+    dynamic_reader_args_t reader_args[DEMO_DYNAMIC_READERS];
+    bool ok = true;
+
+    memset(&ctx, 0, sizeof(ctx));
+    embcli_init(&ctx.cli, "dyncli", NULL);
+    atomic_init(&ctx.stop_readers, false);
+
+    if (!demo_thread_gate_init(&ctx.gate, DEMO_DYNAMIC_WRITERS + DEMO_DYNAMIC_READERS)) {
+        embcli_deinit(&ctx.cli);
+        return false;
+    }
+
+    for (int index = 0; index < DEMO_DYNAMIC_WRITERS; ++index) {
+        writer_args[index].ctx = &ctx;
+        writer_args[index].writer_id = index;
+        writer_args[index].ok = false;
+        writer_args[index].error[0] = '\0';
+        if (pthread_create(&writers[index], NULL, run_dynamic_writer, &writer_args[index]) != 0) {
+            fprintf(stderr, "dynamic writer thread create failed: %d\n", index);
+            ok = false;
+            demo_thread_gate_abort(&ctx.gate);
+            for (int created = 0; created < index; ++created) {
+                pthread_join(writers[created], NULL);
+            }
+            demo_thread_gate_destroy(&ctx.gate);
+            embcli_deinit(&ctx.cli);
+            return false;
+        }
+    }
+
+    for (int index = 0; index < DEMO_DYNAMIC_READERS; ++index) {
+        reader_args[index].ctx = &ctx;
+        reader_args[index].reader_id = index;
+        reader_args[index].ok = false;
+        reader_args[index].error[0] = '\0';
+        if (pthread_create(&readers[index], NULL, run_dynamic_reader, &reader_args[index]) != 0) {
+            fprintf(stderr, "dynamic reader thread create failed: %d\n", index);
+            ok = false;
+            demo_thread_gate_abort(&ctx.gate);
+            atomic_store(&ctx.stop_readers, true);
+            for (int created = 0; created < DEMO_DYNAMIC_WRITERS; ++created) {
+                pthread_join(writers[created], NULL);
+            }
+            for (int created = 0; created < index; ++created) {
+                pthread_join(readers[created], NULL);
+            }
+            demo_thread_gate_destroy(&ctx.gate);
+            embcli_deinit(&ctx.cli);
+            return false;
+        }
+    }
+
+    for (int index = 0; index < DEMO_DYNAMIC_WRITERS; ++index) {
+        pthread_join(writers[index], NULL);
+        if (!writer_args[index].ok) {
+            ok = false;
+            fprintf(stderr, "dynamic writer %d failed: %s\n", index, writer_args[index].error);
+        }
+    }
+
+    atomic_store(&ctx.stop_readers, true);
+
+    for (int index = 0; index < DEMO_DYNAMIC_READERS; ++index) {
+        pthread_join(readers[index], NULL);
+        if (!reader_args[index].ok) {
+            ok = false;
+            fprintf(stderr, "dynamic reader %d failed: %s\n", index, reader_args[index].error);
+        }
+    }
+
+    if (ok) {
+        ok = verify_dynamic_registration(&ctx);
+    }
+
+    demo_thread_gate_destroy(&ctx.gate);
+    embcli_deinit(&ctx.cli);
     return ok;
 }
 
@@ -751,6 +1161,12 @@ int main(int argc, char **argv) {
         printf("[stress] parallel: %s\n", parallel_ok ? "PASS" : "FAIL");
         fflush(stdout);
         ok = parallel_ok;
+    }
+    if (ok) {
+        bool dynamic_ok = run_dynamic_registration_test();
+        printf("[stress] dynamic-registration: %s\n", dynamic_ok ? "PASS" : "FAIL");
+        fflush(stdout);
+        ok = dynamic_ok;
     }
 
     printf("[phase] stop primary server\n");
