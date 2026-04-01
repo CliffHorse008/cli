@@ -107,6 +107,13 @@ typedef struct dynamic_reader_args {
     char error[128];
 } dynamic_reader_args_t;
 
+typedef struct parser_test_fixture {
+    embcli_t cli;
+    embcli_session_t session;
+    demo_mem_writer_t writer;
+    char output[8192];
+} parser_test_fixture_t;
+
 /*
  * selftest 会把 telnet 输出收敛成纯文本，
  * 这样断言就可以基于稳定字符串，而不是依赖终端控制序列。
@@ -302,6 +309,71 @@ static ssize_t demo_recv_quiet(
     return (ssize_t)length;
 }
 
+static ssize_t demo_recv_raw_quiet(
+    int fd,
+    char *buffer,
+    size_t capacity,
+    int total_timeout_ms,
+    int quiet_timeout_ms) {
+    size_t length = 0;
+    int elapsed_ms = 0;
+    int idle_ms = 0;
+    bool seen_data = false;
+
+    if (capacity > 0) {
+        buffer[0] = '\0';
+    }
+
+    while (elapsed_ms < total_timeout_ms) {
+        fd_set readfds;
+        struct timeval tv;
+        int ready;
+        char raw[4096];
+        ssize_t received;
+
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+
+        ready = select(fd + 1, &readfds, NULL, NULL, &tv);
+        elapsed_ms += 100;
+
+        if (ready < 0) {
+            return -1;
+        }
+        if (ready == 0) {
+            if (seen_data) {
+                idle_ms += 100;
+                if (idle_ms >= quiet_timeout_ms) {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        received = recv(fd, raw, sizeof(raw), 0);
+        if (received <= 0) {
+            break;
+        }
+
+        seen_data = true;
+        idle_ms = 0;
+
+        if (buffer != NULL && capacity > 0 && length < capacity - 1U) {
+            size_t writable = (size_t)received;
+            if (writable > capacity - length - 1U) {
+                writable = capacity - length - 1U;
+            }
+            memcpy(buffer + length, raw, writable);
+            length += writable;
+            buffer[length] = '\0';
+        }
+    }
+
+    return (ssize_t)length;
+}
+
 static int demo_count_occurrence(const char *haystack, const char *needle) {
     int count = 0;
     const char *cursor = haystack;
@@ -316,6 +388,14 @@ static int demo_count_occurrence(const char *haystack, const char *needle) {
 static bool demo_expect_contains(const char *output, const char *needle, const char *label) {
     if (strstr(output, needle) == NULL) {
         fprintf(stderr, "expectation failed: %s\nmissing: %s\noutput:\n%s\n", label, needle, output);
+        return false;
+    }
+    return true;
+}
+
+static bool demo_expect_not_contains(const char *output, const char *needle, const char *label) {
+    if (strstr(output, needle) != NULL) {
+        fprintf(stderr, "expectation failed: %s\nunexpected: %s\noutput:\n%s\n", label, needle, output);
         return false;
     }
     return true;
@@ -408,6 +488,165 @@ static void demo_dynamic_command(
     embcli_session_printf(session, "dynamic command %d\r\n", *command_id);
 }
 
+static void parser_cmd_string(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    (void)value_count;
+    (void)user_data;
+    embcli_session_printf(session, "string=%s\r\n", embcli_value_string(&values[0]));
+}
+
+static void parser_cmd_int(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    (void)value_count;
+    (void)user_data;
+    embcli_session_printf(session, "int=%lld\r\n", (long long)values[0].as.i64);
+}
+
+static void parser_cmd_uint(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    (void)value_count;
+    (void)user_data;
+    embcli_session_printf(session, "uint=%llu\r\n", (unsigned long long)values[0].as.u64);
+}
+
+static void parser_cmd_bool(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    (void)value_count;
+    (void)user_data;
+    embcli_session_printf(session, "bool=%s\r\n", values[0].as.boolean ? "true" : "false");
+}
+
+static void parser_cmd_enum(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    const char *const *table = (const char *const *)user_data;
+
+    (void)value_count;
+    embcli_session_printf(session, "enum=%s\r\n", table[values[0].as.enum_index]);
+}
+
+static void parser_cmd_rest(
+    embcli_session_t *session,
+    const embcli_value_t *values,
+    size_t value_count,
+    void *user_data) {
+    (void)value_count;
+    (void)user_data;
+    embcli_session_printf(session, "rest=%s\r\n", embcli_value_string(&values[0]));
+}
+
+static void build_parser_test_cli(embcli_t *cli) {
+    static const char *modes[] = { "alpha", "beta", "gamma" };
+    static const embcli_arg_spec_t string_args[] = {
+        EMBCLI_ARG_STRING_REQ("value", "single string token")
+    };
+    static const embcli_arg_spec_t int_args[] = {
+        EMBCLI_ARG_INT_REQ("value", "signed integer", -10, 10)
+    };
+    static const embcli_arg_spec_t uint_args[] = {
+        EMBCLI_ARG_UINT_REQ("value", "unsigned integer", 0, UINT64_MAX)
+    };
+    static const embcli_arg_spec_t bool_args[] = {
+        EMBCLI_ARG_BOOL_REQ("value", "boolean")
+    };
+    static const embcli_arg_spec_t enum_args[] = {
+        EMBCLI_ARG_ENUM_REQ("value", "alpha/beta/gamma", modes)
+    };
+    static const embcli_arg_spec_t rest_args[] = {
+        EMBCLI_ARG_REST_REQ("value", "rest text")
+    };
+    static embcli_command_t cmd_string;
+    static embcli_command_t cmd_int;
+    static embcli_command_t cmd_uint;
+    static embcli_command_t cmd_bool;
+    static embcli_command_t cmd_enum;
+    static embcli_command_t cmd_rest;
+
+    embcli_init(cli, "parsertest", NULL);
+    embcli_command_init(
+        &cmd_string,
+        "echo",
+        "echo a single string",
+        string_args,
+        EMBCLI_ARRAY_SIZE(string_args),
+        parser_cmd_string,
+        NULL);
+    embcli_command_init(
+        &cmd_int,
+        "signed",
+        "parse signed integer",
+        int_args,
+        EMBCLI_ARRAY_SIZE(int_args),
+        parser_cmd_int,
+        NULL);
+    embcli_command_init(
+        &cmd_uint,
+        "unsigned",
+        "parse unsigned integer",
+        uint_args,
+        EMBCLI_ARRAY_SIZE(uint_args),
+        parser_cmd_uint,
+        NULL);
+    embcli_command_init(
+        &cmd_bool,
+        "flag",
+        "parse bool aliases",
+        bool_args,
+        EMBCLI_ARRAY_SIZE(bool_args),
+        parser_cmd_bool,
+        NULL);
+    embcli_command_init(
+        &cmd_enum,
+        "mode",
+        "parse enum values",
+        enum_args,
+        EMBCLI_ARRAY_SIZE(enum_args),
+        parser_cmd_enum,
+        (void *)modes);
+    embcli_command_init(
+        &cmd_rest,
+        "note",
+        "parse remaining text",
+        rest_args,
+        EMBCLI_ARRAY_SIZE(rest_args),
+        parser_cmd_rest,
+        NULL);
+
+    embcli_menu_add_command(embcli_root_menu(cli), &cmd_string);
+    embcli_menu_add_command(embcli_root_menu(cli), &cmd_int);
+    embcli_menu_add_command(embcli_root_menu(cli), &cmd_uint);
+    embcli_menu_add_command(embcli_root_menu(cli), &cmd_bool);
+    embcli_menu_add_command(embcli_root_menu(cli), &cmd_enum);
+    embcli_menu_add_command(embcli_root_menu(cli), &cmd_rest);
+}
+
+static void parser_test_fixture_init(parser_test_fixture_t *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    build_parser_test_cli(&fixture->cli);
+    fixture->writer.buffer = fixture->output;
+    fixture->writer.capacity = sizeof(fixture->output);
+    demo_mem_writer_reset(&fixture->writer);
+    embcli_session_init(&fixture->session, &fixture->cli, demo_mem_writer_write, &fixture->writer);
+}
+
+static void parser_test_fixture_deinit(parser_test_fixture_t *fixture) {
+    embcli_deinit(&fixture->cli);
+}
+
 static bool demo_open_session(uint16_t port, int *fd_out, char *buffer, size_t capacity) {
     int fd = demo_connect_client(port);
     char fallback[4096];
@@ -471,9 +710,67 @@ static bool demo_start_server(demo_server_ctx_t *ctx, uint16_t port, int max_cli
     return true;
 }
 
+static bool demo_wait_for_active_clients(
+    embcli_telnet_server_t *server,
+    int expected,
+    int timeout_ms) {
+    int elapsed_ms = 0;
+
+    while (elapsed_ms <= timeout_ms) {
+        if (embcli_telnet_server_active_clients(server) == expected) {
+            return true;
+        }
+
+        {
+            struct timeval delay;
+            delay.tv_sec = 0;
+            delay.tv_usec = 100000;
+            select(0, NULL, NULL, NULL, &delay);
+        }
+        elapsed_ms += 100;
+    }
+
+    return false;
+}
+
 static void demo_stop_server(demo_server_ctx_t *ctx) {
     embcli_telnet_server_stop(&ctx->server);
     embcli_deinit(&ctx->cli);
+}
+
+static bool run_server_api_test(demo_server_ctx_t *ctx) {
+    int fd = -1;
+    char output[DEMO_FEATURE_MAX];
+    bool ok = true;
+
+    if (!embcli_telnet_server_is_running(&ctx->server)) {
+        fprintf(stderr, "server api: expected running state after start\n");
+        return false;
+    }
+    if (embcli_telnet_server_active_clients(&ctx->server) != 0) {
+        fprintf(stderr, "server api: expected zero active clients before connect\n");
+        return false;
+    }
+
+    if (!demo_open_session(ctx->port, &fd, output, sizeof(output))) {
+        return false;
+    }
+    if (!demo_wait_for_active_clients(&ctx->server, 1, 2000)) {
+        fprintf(stderr, "server api: active client count did not become 1\n");
+        ok = false;
+    }
+
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
+    }
+
+    if (!demo_wait_for_active_clients(&ctx->server, 0, 2000)) {
+        fprintf(stderr, "server api: active client count did not return to 0\n");
+        ok = false;
+    }
+
+    return ok;
 }
 
 static bool test_banner_and_root(uint16_t port) {
@@ -512,7 +809,7 @@ static bool test_navigation_and_help(uint16_t port) {
         return false;
     }
 
-    if (demo_recv_quiet(fd, output, sizeof(output), 4000, 250) < 0) {
+    if (demo_recv_raw_quiet(fd, output, sizeof(output), 4000, 250) < 0) {
         close(fd);
         return false;
     }
@@ -523,6 +820,81 @@ static bool test_navigation_and_help(uint16_t port) {
            demo_expect_contains(output, "leave menu: system", "leave system") &&
            demo_expect_contains(output, "enter menu: network", "enter network") &&
            demo_expect_contains(output, "command : config", "help config");
+}
+
+static bool test_path_execution(uint16_t port) {
+    int fd;
+    char output[DEMO_FEATURE_MAX];
+
+    if (!demo_open_session(port, &fd, output, sizeof(output))) {
+        return false;
+    }
+
+    if (!demo_send_line(fd, "system/log-level error") ||
+        !demo_send_line(fd, "help reboot") ||
+        !demo_send_line(fd, "/system") ||
+        !demo_send_line(fd, "/network/config 10.1.2.3 255.255.255.0 10.1.2.1") ||
+        !demo_send_line(fd, "help reboot") ||
+        !demo_send_line(fd, "help /system/reboot") ||
+        !demo_send_line(fd, "exit")) {
+        close(fd);
+        return false;
+    }
+
+    if (demo_recv_quiet(fd, output, sizeof(output), 4000, 250) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    return demo_expect_contains(output, "log level => error", "path command execution") &&
+           demo_expect_contains(output, "no such item: reboot", "path command keeps root menu") &&
+           demo_expect_contains(output, "enter menu: /system", "absolute path menu enter") &&
+           demo_expect_contains(output, "network => ip=10.1.2.3 mask=255.255.255.0 gateway=10.1.2.1", "absolute path command execution") &&
+           demo_count_occurrence(output, "command : reboot") >= 2 &&
+           demo_expect_not_contains(output, "enter menu: system/log-level", "path command should not enter menu");
+}
+
+static bool test_input_boundaries(uint16_t port) {
+    int fd;
+    char output[8192];
+    char chunk[101];
+    char tail[11];
+
+    if (!demo_open_session(port, &fd, output, sizeof(output))) {
+        return false;
+    }
+
+    memset(chunk, 'x', sizeof(chunk) - 1U);
+    chunk[sizeof(chunk) - 1U] = '\0';
+    memset(tail, 'x', sizeof(tail) - 1U);
+    tail[sizeof(tail) - 1U] = '\0';
+
+    for (int index = 0; index < 5; ++index) {
+        if (!demo_send_all(fd, chunk, strlen(chunk)) ||
+            demo_recv_raw_quiet(fd, NULL, 0, 2000, 150) < 0) {
+            close(fd);
+            return false;
+        }
+    }
+
+    if (!demo_send_all(fd, tail, strlen(tail)) ||
+        demo_recv_raw_quiet(fd, NULL, 0, 2000, 150) < 0 ||
+        !demo_send_text(fd, "xx\r") ||
+        !demo_send_line(fd, "version") ||
+        !demo_send_line(fd, "exit")) {
+        close(fd);
+        return false;
+    }
+
+    if (demo_recv_raw_quiet(fd, output, sizeof(output), 4000, 250) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    return demo_expect_contains(output, "input too long", "telnet line overflow") &&
+           demo_expect_contains(output, "demo-fw 1.0.0", "session still usable after overflow");
 }
 
 static bool test_parameters_and_errors(uint16_t port) {
@@ -565,6 +937,118 @@ static bool test_parameters_and_errors(uint16_t port) {
            demo_expect_contains(output, "led[2] => on=true blink=true", "bool params") &&
            demo_expect_contains(output, "out of range for id: 0 .. 7", "uint range") &&
            demo_expect_contains(output, "unknown command: unknown-command", "unknown command");
+}
+
+static bool run_parser_interface_tests(void) {
+    parser_test_fixture_t fixture;
+    char long_line[700];
+    char token_line[256];
+    size_t offset = 0;
+    bool ok = true;
+
+    parser_test_fixture_init(&fixture);
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "echo \"hello world\"");
+    ok = ok && demo_expect_contains(fixture.output, "string=hello world", "quoted string");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "echo hello\\ world");
+    ok = ok && demo_expect_contains(fixture.output, "string=hello world", "escaped space");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "signed -8");
+    ok = ok && demo_expect_contains(fixture.output, "int=-8", "signed integer");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "signed");
+    ok = ok && demo_expect_contains(fixture.output, "missing argument: value", "missing int argument");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "signed abc");
+    ok = ok && demo_expect_contains(fixture.output, "invalid integer for value: abc", "invalid int text");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "signed 999999999999999999999999");
+    ok = ok && demo_expect_contains(fixture.output, "out of range for value: -10 .. 10", "int overflow");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "unsigned 18446744073709551615");
+    ok = ok && demo_expect_contains(fixture.output, "uint=18446744073709551615", "uint max value");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "unsigned -1");
+    ok = ok && demo_expect_contains(fixture.output, "invalid unsigned integer for value: -1", "negative uint rejected");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "unsigned 18446744073709551616");
+    ok = ok && demo_expect_contains(
+        fixture.output,
+        "out of range for value: 0 .. 18446744073709551615",
+        "uint overflow");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "flag ENABLED");
+    ok = ok && demo_expect_contains(fixture.output, "bool=true", "bool truthy alias");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "flag disable");
+    ok = ok && demo_expect_contains(fixture.output, "bool=false", "bool falsy alias");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "flag maybe");
+    ok = ok && demo_expect_contains(fixture.output, "invalid boolean for value: maybe", "invalid bool");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "mode BETA");
+    ok = ok && demo_expect_contains(fixture.output, "enum=beta", "enum case insensitive");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "mode delta");
+    ok = ok && demo_expect_contains(fixture.output, "invalid enum for value: delta", "invalid enum");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "note maintenance window tonight");
+    ok = ok && demo_expect_contains(fixture.output, "rest=maintenance window tonight", "rest capture");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "echo one two");
+    ok = ok && demo_expect_contains(fixture.output, "too many arguments", "extra arguments");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "echo \"unterminated");
+    ok = ok && demo_expect_contains(fixture.output, "parse error: unterminated quote", "unterminated quote");
+
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, "echo hello\\");
+    ok = ok && demo_expect_contains(fixture.output, "parse error: dangling escape", "dangling escape");
+
+    memset(token_line, 0, sizeof(token_line));
+    for (int index = 0; index < 25; ++index) {
+        int written = snprintf(
+            token_line + offset,
+            sizeof(token_line) - offset,
+            "%sarg%d",
+            index == 0 ? "" : " ",
+            index);
+        if (written < 0 || (size_t)written >= sizeof(token_line) - offset) {
+            ok = false;
+            break;
+        }
+        offset += (size_t)written;
+    }
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, token_line);
+    ok = ok && demo_expect_contains(fixture.output, "parse error: too many tokens", "too many tokens");
+
+    memset(long_line, 'L', sizeof(long_line));
+    long_line[sizeof(long_line) - 1] = '\0';
+    demo_mem_writer_reset(&fixture.writer);
+    embcli_session_process_line(&fixture.session, long_line);
+    ok = ok && demo_expect_contains(fixture.output, "input too long", "core api long input");
+
+    parser_test_fixture_deinit(&fixture);
+    return ok;
 }
 
 static bool test_completion_and_history(uint16_t port) {
@@ -623,15 +1107,18 @@ static bool run_feature_demo(uint16_t port) {
         const char *name;
         bool (*fn)(uint16_t port);
     } tests[] = {
+        { "parser-interface", NULL },
         { "banner-and-root", test_banner_and_root },
         { "navigation-and-help", test_navigation_and_help },
+        { "path-execution", test_path_execution },
+        { "input-boundaries", test_input_boundaries },
         { "parameters-and-errors", test_parameters_and_errors },
         { "completion-and-history", test_completion_and_history }
     };
 
     /* 固定顺序执行功能测试，便于在失败时直接定位阶段。 */
     for (size_t index = 0; index < sizeof(tests) / sizeof(tests[0]); ++index) {
-        bool ok = tests[index].fn(port);
+        bool ok = tests[index].fn != NULL ? tests[index].fn(port) : run_parser_interface_tests();
         printf("[feature] %s: %s\n", tests[index].name, ok ? "PASS" : "FAIL");
         if (!ok) {
             return false;
@@ -757,7 +1244,7 @@ static void *run_stress_worker(void *arg) {
             snprintf(worker->error, sizeof(worker->error), "send failed");
             goto cleanup;
         }
-        if (demo_recv_quiet(fd, output, sizeof(output), 5000, 250) < 0) {
+        if (demo_recv_raw_quiet(fd, output, sizeof(output), 5000, 250) < 0) {
             snprintf(worker->error, sizeof(worker->error), "recv failed");
             goto cleanup;
         }
@@ -822,6 +1309,136 @@ static bool run_parallel_stress(uint16_t port, int clients, int loops) {
         if (!workers[index].ok) {
             ok = false;
             fprintf(stderr, "parallel stress worker %d failed: %s\n", index, workers[index].error);
+        }
+    }
+
+    free(threads);
+    free(workers);
+    return ok;
+}
+
+static void *run_edge_stress_worker(void *arg) {
+    stress_worker_args_t *worker = (stress_worker_args_t *)arg;
+    int fd = -1;
+    char banner[4096];
+    char output[16384];
+    char chunk[101];
+    char tail[11];
+
+    worker->ok = false;
+    worker->error[0] = '\0';
+
+    if (!demo_open_session(worker->port, &fd, banner, sizeof(banner))) {
+        snprintf(worker->error, sizeof(worker->error), "connect/open failed");
+        return NULL;
+    }
+
+    memset(chunk, 'a' + (worker->worker_id % 26), sizeof(chunk) - 1U);
+    chunk[sizeof(chunk) - 1U] = '\0';
+    memset(tail, 'a' + (worker->worker_id % 26), sizeof(tail) - 1U);
+    tail[sizeof(tail) - 1U] = '\0';
+
+    for (int index = 0; index < worker->loops; ++index) {
+        if (!demo_send_line(fd, "system/log-level info") ||
+            !demo_send_line(fd, "system/log-level verbose") ||
+            !demo_send_line(fd, "help /system/reboot") ||
+            !demo_send_line(fd, "network/config 10.0.0.2 255.255.255.0 10.0.0.1") ||
+            !demo_send_line(fd, "device/set 0 enabled disabled")) {
+            snprintf(worker->error, sizeof(worker->error), "send failed");
+            goto cleanup;
+        }
+
+        if (demo_recv_quiet(fd, output, sizeof(output), 5000, 250) < 0) {
+            snprintf(worker->error, sizeof(worker->error), "recv failed");
+            goto cleanup;
+        }
+
+        if (strstr(output, "log level => info") == NULL ||
+            strstr(output, "invalid enum for level: verbose") == NULL ||
+            strstr(output, "command : reboot") == NULL ||
+            strstr(output, "network => ip=10.0.0.2 mask=255.255.255.0 gateway=10.0.0.1") == NULL ||
+            strstr(output, "led[0] => on=true blink=false") == NULL) {
+            snprintf(worker->error, sizeof(worker->error), "unexpected functional output in loop %d", index);
+            goto cleanup;
+        }
+
+        for (int chunk_index = 0; chunk_index < 5; ++chunk_index) {
+            if (!demo_send_all(fd, chunk, strlen(chunk)) ||
+                demo_recv_raw_quiet(fd, NULL, 0, 2000, 150) < 0) {
+                snprintf(worker->error, sizeof(worker->error), "edge prefill failed");
+                goto cleanup;
+            }
+        }
+
+        if (!demo_send_all(fd, tail, strlen(tail)) ||
+            demo_recv_raw_quiet(fd, NULL, 0, 2000, 150) < 0 ||
+            !demo_send_text(fd, "aa\r") ||
+            !demo_send_line(fd, "version")) {
+            snprintf(worker->error, sizeof(worker->error), "edge send failed");
+            goto cleanup;
+        }
+
+        if (demo_recv_raw_quiet(fd, output, sizeof(output), 5000, 250) < 0) {
+            snprintf(worker->error, sizeof(worker->error), "edge recv failed");
+            goto cleanup;
+        }
+
+        if (strstr(output, "input too long") == NULL ||
+            strstr(output, "demo-fw 1.0.0") == NULL) {
+            snprintf(worker->error, sizeof(worker->error), "unexpected edge output in loop %d", index);
+            goto cleanup;
+        }
+    }
+
+    if (!demo_send_line(fd, "exit")) {
+        snprintf(worker->error, sizeof(worker->error), "exit failed");
+        goto cleanup;
+    }
+    if (demo_recv_quiet(fd, output, sizeof(output), 2000, 200) < 0) {
+        snprintf(worker->error, sizeof(worker->error), "exit recv failed");
+        goto cleanup;
+    }
+
+    worker->ok = true;
+
+cleanup:
+    if (fd >= 0) {
+        close(fd);
+    }
+    return NULL;
+}
+
+static bool run_parallel_edge_stress(uint16_t port, int clients, int loops) {
+    pthread_t *threads = NULL;
+    stress_worker_args_t *workers = NULL;
+    bool ok = true;
+
+    threads = (pthread_t *)calloc((size_t)clients, sizeof(*threads));
+    workers = (stress_worker_args_t *)calloc((size_t)clients, sizeof(*workers));
+    if (threads == NULL || workers == NULL) {
+        free(threads);
+        free(workers);
+        return false;
+    }
+
+    for (int index = 0; index < clients; ++index) {
+        workers[index].port = port;
+        workers[index].worker_id = index;
+        workers[index].loops = loops;
+        if (pthread_create(&threads[index], NULL, run_edge_stress_worker, &workers[index]) != 0) {
+            ok = false;
+            workers[index].ok = false;
+            snprintf(workers[index].error, sizeof(workers[index].error), "pthread_create failed");
+            clients = index;
+            break;
+        }
+    }
+
+    for (int index = 0; index < clients; ++index) {
+        pthread_join(threads[index], NULL);
+        if (!workers[index].ok) {
+            ok = false;
+            fprintf(stderr, "parallel edge worker %d failed: %s\n", index, workers[index].error);
         }
     }
 
@@ -1144,9 +1761,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    printf("[phase] server-api start\n");
+    fflush(stdout);
+    ok = run_server_api_test(&server);
+    printf("[phase] server-api done: %s\n", ok ? "PASS" : "FAIL");
+    fflush(stdout);
+
     printf("[phase] feature-demo start\n");
     fflush(stdout);
-    ok = run_feature_demo(port);
+    if (ok) {
+        ok = run_feature_demo(port);
+    }
     printf("[phase] feature-demo done: %s\n", ok ? "PASS" : "FAIL");
     fflush(stdout);
 
@@ -1161,6 +1786,12 @@ int main(int argc, char **argv) {
         printf("[stress] parallel: %s\n", parallel_ok ? "PASS" : "FAIL");
         fflush(stdout);
         ok = parallel_ok;
+    }
+    if (ok) {
+        bool parallel_edge_ok = run_parallel_edge_stress(port, parallel_clients, parallel_loops);
+        printf("[stress] parallel-edge: %s\n", parallel_edge_ok ? "PASS" : "FAIL");
+        fflush(stdout);
+        ok = parallel_edge_ok;
     }
     if (ok) {
         bool dynamic_ok = run_dynamic_registration_test();

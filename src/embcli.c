@@ -1,6 +1,7 @@
 #include "embcli/embcli.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -92,6 +93,106 @@ static const embcli_command_t *embcli_find_command(const embcli_menu_t *menu, co
         command = command->next;
     }
     return NULL;
+}
+
+static bool embcli_name_equals_segment(const char *name, const char *segment, size_t segment_len) {
+    return strncmp(name, segment, segment_len) == 0 && name[segment_len] == '\0';
+}
+
+static const embcli_menu_t *embcli_find_child_menu_segment(
+    const embcli_menu_t *menu,
+    const char *segment,
+    size_t segment_len) {
+    const embcli_menu_t *child = menu->children;
+    while (child != NULL) {
+        if (embcli_name_equals_segment(child->name, segment, segment_len)) {
+            return child;
+        }
+        child = child->next;
+    }
+    return NULL;
+}
+
+static const embcli_command_t *embcli_find_command_segment(
+    const embcli_menu_t *menu,
+    const char *segment,
+    size_t segment_len) {
+    const embcli_command_t *command = menu->commands;
+    while (command != NULL) {
+        if (embcli_name_equals_segment(command->name, segment, segment_len)) {
+            return command;
+        }
+        command = command->next;
+    }
+    return NULL;
+}
+
+static bool embcli_resolve_path(
+    const embcli_session_t *session,
+    const char *path,
+    const embcli_menu_t **menu_out,
+    const embcli_command_t **command_out) {
+    const embcli_menu_t *menu;
+    const char *cursor;
+
+    if (session == NULL || path == NULL || *path == '\0') {
+        return false;
+    }
+
+    menu = session->current_menu;
+    cursor = path;
+
+    if (*cursor == '/') {
+        menu = &session->cli->root_menu;
+        while (*cursor == '/') {
+            ++cursor;
+        }
+    }
+
+    if (*cursor == '\0') {
+        *menu_out = menu;
+        *command_out = NULL;
+        return true;
+    }
+
+    while (*cursor != '\0') {
+        const char *slash = strchr(cursor, '/');
+        size_t segment_len = slash != NULL ? (size_t)(slash - cursor) : strlen(cursor);
+
+        if (segment_len == 0) {
+            return false;
+        }
+
+        if (slash == NULL) {
+            const embcli_menu_t *child_menu = embcli_find_child_menu_segment(menu, cursor, segment_len);
+            if (child_menu != NULL) {
+                *menu_out = child_menu;
+                *command_out = NULL;
+                return true;
+            }
+
+            *menu_out = menu;
+            *command_out = embcli_find_command_segment(menu, cursor, segment_len);
+            return *command_out != NULL;
+        }
+
+        menu = embcli_find_child_menu_segment(menu, cursor, segment_len);
+        if (menu == NULL) {
+            return false;
+        }
+
+        cursor = slash + 1;
+        while (*cursor == '/') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            *menu_out = menu;
+            *command_out = NULL;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static void embcli_append_text(char *buffer, size_t buffer_size, size_t *offset, const char *text) {
@@ -369,13 +470,14 @@ static bool embcli_parse_values(
             value->as.str = text;
             break;
         case EMBCLI_ARG_INT: {
+            errno = 0;
             char *end = NULL;
             long long parsed = strtoll(text, &end, 0);
             if (*text == '\0' || end == NULL || *end != '\0') {
                 embcli_session_printf(session, "invalid integer for %s: %s\r\n", spec->name, text);
                 return false;
             }
-            if ((int64_t)parsed < spec->int_min || (int64_t)parsed > spec->int_max) {
+            if (errno == ERANGE || (int64_t)parsed < spec->int_min || (int64_t)parsed > spec->int_max) {
                 embcli_session_printf(
                     session,
                     "out of range for %s: %" PRId64 " .. %" PRId64 "\r\n",
@@ -388,13 +490,18 @@ static bool embcli_parse_values(
             break;
         }
         case EMBCLI_ARG_UINT: {
+            errno = 0;
             char *end = NULL;
+            if (text[0] == '-') {
+                embcli_session_printf(session, "invalid unsigned integer for %s: %s\r\n", spec->name, text);
+                return false;
+            }
             unsigned long long parsed = strtoull(text, &end, 0);
             if (*text == '\0' || end == NULL || *end != '\0') {
                 embcli_session_printf(session, "invalid unsigned integer for %s: %s\r\n", spec->name, text);
                 return false;
             }
-            if ((uint64_t)parsed < spec->uint_min || (uint64_t)parsed > spec->uint_max) {
+            if (errno == ERANGE || (uint64_t)parsed < spec->uint_min || (uint64_t)parsed > spec->uint_max) {
                 embcli_session_printf(
                     session,
                     "out of range for %s: %" PRIu64 " .. %" PRIu64 "\r\n",
@@ -449,6 +556,21 @@ static void embcli_show_help(embcli_session_t *session, const char *target_name)
     }
 
     embcli_read_lock(cli);
+    if (strchr(target_name, '/') != NULL) {
+        const embcli_menu_t *menu = NULL;
+        const embcli_command_t *command = NULL;
+
+        if (embcli_resolve_path(session, target_name, &menu, &command)) {
+            if (command != NULL) {
+                embcli_print_command_detail(session, command);
+            } else {
+                embcli_print_submenu_detail(session, menu);
+            }
+            embcli_unlock(cli);
+            return;
+        }
+    }
+
     const embcli_menu_t *menu = embcli_find_child_menu(session->current_menu, target_name);
     if (menu != NULL) {
         embcli_print_submenu_detail(session, menu);
@@ -670,6 +792,12 @@ void embcli_session_process_line(embcli_session_t *session, const char *line) {
         return;
     }
 
+    if (strlen(line) >= sizeof(line_buffer)) {
+        embcli_session_write(session, "input too long\r\n");
+        embcli_session_prompt(session);
+        return;
+    }
+
     snprintf(line_buffer, sizeof(line_buffer), "%s", line);
     if (!embcli_tokenize(line_buffer, tokens, EMBCLI_MAX_TOKENS, &token_count, &token_error)) {
         embcli_session_printf(session, "parse error: %s\r\n", token_error);
@@ -710,6 +838,56 @@ void embcli_session_process_line(embcli_session_t *session, const char *line) {
     }
 
     embcli_read_lock(cli);
+    if (strchr(verb, '/') != NULL) {
+        const embcli_menu_t *resolved_menu = NULL;
+        const embcli_command_t *resolved_command = NULL;
+
+        if (embcli_resolve_path(session, verb, &resolved_menu, &resolved_command)) {
+            embcli_unlock(cli);
+
+            if (resolved_command != NULL) {
+                memset(values, 0, sizeof(values));
+                if (!embcli_parse_values(
+                        session,
+                        resolved_command,
+                        tokens,
+                        token_count,
+                        values,
+                        rest_buffer,
+                        sizeof(rest_buffer))) {
+                    embcli_print_command_detail(session, resolved_command);
+                    embcli_session_prompt(session);
+                    return;
+                }
+
+                if (resolved_command->handler != NULL) {
+                    resolved_command->handler(
+                        session,
+                        values,
+                        resolved_command->arg_count,
+                        resolved_command->user_data);
+                }
+
+                if (!session->close_requested) {
+                    embcli_session_prompt(session);
+                }
+                return;
+            }
+
+            if (token_count == 1) {
+                session->current_menu = (embcli_menu_t *)resolved_menu;
+                embcli_session_printf(session, "enter menu: %s\r\n", verb);
+                embcli_session_show_current_menu(session);
+                embcli_session_prompt(session);
+                return;
+            }
+
+            embcli_session_printf(session, "unknown command: %s\r\n", verb);
+            embcli_session_prompt(session);
+            return;
+        }
+    }
+
     const embcli_menu_t *child_menu = embcli_find_child_menu(session->current_menu, verb);
     if (child_menu != NULL && token_count == 1) {
         /* 进入菜单的行为被建模为“输入菜单名并回车”。 */

@@ -136,11 +136,28 @@ embcli_telnet_server_start(&server, &config);
 board> system
 ```
 
+也支持路径式进入，适合脚本从任意位置直接跳转：
+
+```text
+board> /system
+board/system> /network
+```
+
 退出子菜单：
 
 ```text
 board/system> back
 ```
+
+执行子菜单命令时，除了先进入菜单再输入命令，也支持一条路径命令直接执行：
+
+```text
+board> system/log-level warn
+board> /network/config 192.168.10.2 255.255.255.0 192.168.10.1
+board/system> /device/set 2 on true
+```
+
+路径式执行命令不会修改当前所在菜单，因此很适合外部自动化脚本调用。
 
 查看帮助：
 
@@ -148,6 +165,8 @@ board/system> back
 help
 help reboot
 help system
+help system/reboot
+help /network/config
 ```
 
 关闭会话：
@@ -168,6 +187,17 @@ set <Tab>       -> 对不可自动补全的参数显示类型/范围提示
 ↑ / ↓           -> 浏览本会话历史命令
 ```
 
+## 脚本调用建议
+
+如果外部脚本需要一步执行深层菜单命令，推荐直接发送路径式命令，而不是先切菜单再发送第二条命令：
+
+```bash
+printf 'system/log-level warn\r' | nc 127.0.0.1 2323
+printf '/network/config 192.168.10.2 255.255.255.0 192.168.10.1\r' | nc 127.0.0.1 2323
+```
+
+如果脚本是在某个已进入的菜单下运行，使用以 `/` 开头的绝对路径更稳定，不受当前菜单位置影响。
+
 ## 设计说明
 
 - CLI 核心与传输层解耦，`embcli_session_*` 只依赖输出回调
@@ -179,14 +209,19 @@ set <Tab>       -> 对不可自动补全的参数显示类型/范围提示
 
 `embcli_demo_selftest` 会自动覆盖以下内容：
 
+- `embcli_session_process_line()` 直接接口解析，包括引用、转义、缺参、多参、过多 token、超长输入
 - 首屏 banner、根菜单、提示符
 - 菜单进入/退出、`help` 和命令明细
-- `STRING/UINT/BOOL/ENUM/REST` 参数解析
+- `STRING/INT/UINT/BOOL/ENUM/REST` 参数解析
+- 数值溢出、负数传给 `UINT`、非法布尔值、非法枚举值
 - 非法参数、越界参数、未知命令
+- telnet 行缓冲区上限与超长输入恢复
 - `Tab` 命令补全、`help` 目标补全、参数级补全、参数提示
 - `↑/↓` 历史命令
+- server `is_running/active_clients` 状态接口
 - 顺序循环压测
 - 多客户端并发压测
+- 多客户端并发异常流量压测（路径命令、非法参数、超长行混合）
 - `max_clients` 连接上限与 `server busy` 行为
 
 默认参数下会执行完整功能遍历，并跑一轮中等强度压力测试；命令行参数可进一步放大循环次数和并发数。
