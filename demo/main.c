@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     embcli_t cli;
     embcli_telnet_server_t server;
     embcli_telnet_config_t config;
-    const char *bind_address = "0.0.0.0";
+    const char *bind_address = "127.0.0.1";
     uint16_t port = 2323;
 
     if (argc > 1) {
@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         bind_address = argv[2];
     }
 
-    build_demo_cli(&cli);
+    build_demo_cli(&cli, &server);
 
     config.cli = &cli;
     config.bind_address = bind_address;

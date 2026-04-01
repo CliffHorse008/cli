@@ -685,7 +685,7 @@ static bool demo_start_server(demo_server_ctx_t *ctx, uint16_t port, int max_cli
     embcli_telnet_config_t config;
 
     memset(ctx, 0, sizeof(*ctx));
-    build_demo_cli(&ctx->cli);
+    build_demo_cli(&ctx->cli, &ctx->server);
 
     ctx->port = port;
     ctx->max_clients = max_clients;
@@ -747,6 +747,10 @@ static bool run_server_api_test(demo_server_ctx_t *ctx) {
         fprintf(stderr, "server api: expected running state after start\n");
         return false;
     }
+    if (strcmp(embcli_telnet_server_bind_address(&ctx->server), DEMO_HOST) != 0) {
+        fprintf(stderr, "server api: expected default bind address %s\n", DEMO_HOST);
+        return false;
+    }
     if (embcli_telnet_server_active_clients(&ctx->server) != 0) {
         fprintf(stderr, "server api: expected zero active clients before connect\n");
         return false;
@@ -770,7 +774,56 @@ static bool run_server_api_test(demo_server_ctx_t *ctx) {
         ok = false;
     }
 
+    if (embcli_telnet_server_rebind(&ctx->server, "0.0.0.0") != 0 ||
+        strcmp(embcli_telnet_server_bind_address(&ctx->server), "0.0.0.0") != 0) {
+        fprintf(stderr, "server api: failed to rebind to 0.0.0.0\n");
+        ok = false;
+    }
+    if (ok &&
+        (!demo_open_session(ctx->port, &fd, output, sizeof(output)) ||
+         !demo_wait_for_active_clients(&ctx->server, 1, 2000))) {
+        fprintf(stderr, "server api: failed to accept connection after public rebind\n");
+        ok = false;
+    }
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
+        (void)demo_wait_for_active_clients(&ctx->server, 0, 2000);
+    }
+
+    if (embcli_telnet_server_rebind(&ctx->server, DEMO_HOST) != 0 ||
+        strcmp(embcli_telnet_server_bind_address(&ctx->server), DEMO_HOST) != 0) {
+        fprintf(stderr, "server api: failed to rebind back to %s\n", DEMO_HOST);
+        ok = false;
+    }
+
     return ok;
+}
+
+static bool test_telnet_rebind_command(demo_server_ctx_t *ctx) {
+    int fd;
+    char output[DEMO_FEATURE_MAX];
+
+    if (!demo_open_session(ctx->port, &fd, output, sizeof(output))) {
+        return false;
+    }
+
+    if (!demo_send_line(fd, "system/telnet-access on") ||
+        !demo_send_line(fd, "system/telnet-access off") ||
+        !demo_send_line(fd, "exit")) {
+        close(fd);
+        return false;
+    }
+
+    if (demo_recv_quiet(fd, output, sizeof(output), 4000, 250) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    return demo_expect_contains(output, "telnet bind => 0.0.0.0", "enable public telnet") &&
+           demo_expect_contains(output, "telnet bind => 127.0.0.1", "disable public telnet") &&
+           strcmp(embcli_telnet_server_bind_address(&ctx->server), "127.0.0.1") == 0;
 }
 
 static bool test_banner_and_root(uint16_t port) {
@@ -1765,6 +1818,14 @@ int main(int argc, char **argv) {
     fflush(stdout);
     ok = run_server_api_test(&server);
     printf("[phase] server-api done: %s\n", ok ? "PASS" : "FAIL");
+    fflush(stdout);
+
+    printf("[phase] rebind-command start\n");
+    fflush(stdout);
+    if (ok) {
+        ok = test_telnet_rebind_command(&server);
+    }
+    printf("[phase] rebind-command done: %s\n", ok ? "PASS" : "FAIL");
     fflush(stdout);
 
     printf("[phase] feature-demo start\n");

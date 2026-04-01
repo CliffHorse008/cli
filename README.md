@@ -43,6 +43,8 @@ cmake --build build
 ./build/embcli_demo
 ```
 
+默认只监听 `127.0.0.1`，便于先本地调试、不直接暴露到外网。
+
 指定端口运行：
 
 ```bash
@@ -126,6 +128,19 @@ embcli_telnet_server_t server;
 embcli_telnet_server_start(&server, &config);
 ```
 
+运行中切换监听地址：
+
+```c
+embcli_telnet_server_rebind(&server, "0.0.0.0");   /* 允许外网访问 */
+embcli_telnet_server_rebind(&server, "127.0.0.1"); /* 恢复仅本地访问 */
+```
+
+查询当前监听地址：
+
+```c
+const char *bind = embcli_telnet_server_bind_address(&server);
+```
+
 ## 菜单行为
 
 连接后会显示当前菜单项和命令列表。
@@ -158,6 +173,15 @@ board/system> /device/set 2 on true
 ```
 
 路径式执行命令不会修改当前所在菜单，因此很适合外部自动化脚本调用。
+
+demo 还提供了运行时切换 telnet 暴露范围的命令：
+
+```text
+board> system/telnet-access on
+board> system/telnet-access off
+```
+
+`on` 会把监听地址切到 `0.0.0.0`，`off` 会切回 `127.0.0.1`。
 
 查看帮助：
 

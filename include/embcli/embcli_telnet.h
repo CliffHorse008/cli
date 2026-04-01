@@ -21,6 +21,7 @@ typedef struct embcli_telnet_config {
 
 typedef struct embcli_telnet_server {
     embcli_telnet_config_t config;
+    char bind_address_storage[64];
     int listen_fd;
     bool running;
     pthread_t accept_thread;
@@ -32,8 +33,10 @@ int embcli_telnet_server_start(
     embcli_telnet_server_t *server,
     const embcli_telnet_config_t *config);
 void embcli_telnet_server_stop(embcli_telnet_server_t *server);
+int embcli_telnet_server_rebind(embcli_telnet_server_t *server, const char *bind_address);
 bool embcli_telnet_server_is_running(embcli_telnet_server_t *server);
 int embcli_telnet_server_active_clients(embcli_telnet_server_t *server);
+const char *embcli_telnet_server_bind_address(embcli_telnet_server_t *server);
 
 #ifdef __cplusplus
 }

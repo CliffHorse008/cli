@@ -96,6 +96,37 @@ typedef struct embcli_telnet_builtin {
     const char *summary;
 } embcli_telnet_builtin_t;
 
+static void embcli_telnet_wake_listener(embcli_telnet_server_t *server);
+
+static const char *embcli_telnet_default_bind_address(const char *bind_address) {
+    return (bind_address == NULL || bind_address[0] == '\0') ? "0.0.0.0" : bind_address;
+}
+
+static bool embcli_telnet_validate_bind_address(const char *bind_address) {
+    struct in_addr address;
+    const char *value = embcli_telnet_default_bind_address(bind_address);
+
+    if (strcmp(value, "0.0.0.0") == 0) {
+        return true;
+    }
+
+    return inet_pton(AF_INET, value, &address) == 1;
+}
+
+static bool embcli_telnet_store_bind_address(
+    embcli_telnet_server_t *server,
+    const char *bind_address) {
+    const char *value = embcli_telnet_default_bind_address(bind_address);
+
+    if (strlen(value) >= sizeof(server->bind_address_storage)) {
+        return false;
+    }
+
+    snprintf(server->bind_address_storage, sizeof(server->bind_address_storage), "%s", value);
+    server->config.bind_address = server->bind_address_storage;
+    return true;
+}
+
 static void embcli_telnet_session_write(void *ctx, const char *data, size_t len) {
     int socket_fd = *(int *)ctx;
     while (len > 0) {
@@ -1069,6 +1100,36 @@ static void *embcli_telnet_accept_thread(void *arg) {
     return NULL;
 }
 
+static int embcli_telnet_start_accept_loop(embcli_telnet_server_t *server) {
+    server->listen_fd = embcli_telnet_make_listener(&server->config);
+    if (server->listen_fd < 0) {
+        return -1;
+    }
+
+    server->running = true;
+    if (pthread_create(&server->accept_thread, NULL, embcli_telnet_accept_thread, server) != 0) {
+        server->running = false;
+        close(server->listen_fd);
+        server->listen_fd = -1;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void embcli_telnet_stop_accept_loop(embcli_telnet_server_t *server) {
+    if (server == NULL || !server->running) {
+        return;
+    }
+
+    server->running = false;
+    embcli_telnet_wake_listener(server);
+    pthread_join(server->accept_thread, NULL);
+    shutdown(server->listen_fd, SHUT_RDWR);
+    close(server->listen_fd);
+    server->listen_fd = -1;
+}
+
 int embcli_telnet_server_start(
     embcli_telnet_server_t *server,
     const embcli_telnet_config_t *config) {
@@ -1089,16 +1150,12 @@ int embcli_telnet_server_start(
         return -1;
     }
 
-    server->listen_fd = embcli_telnet_make_listener(&server->config);
-    if (server->listen_fd < 0) {
+    if (!embcli_telnet_validate_bind_address(server->config.bind_address) ||
+        !embcli_telnet_store_bind_address(server, server->config.bind_address)) {
         return -1;
     }
 
-    server->running = true;
-    if (pthread_create(&server->accept_thread, NULL, embcli_telnet_accept_thread, server) != 0) {
-        server->running = false;
-        close(server->listen_fd);
-        server->listen_fd = -1;
+    if (embcli_telnet_start_accept_loop(server) != 0) {
         return -1;
     }
 
@@ -1143,12 +1200,39 @@ void embcli_telnet_server_stop(embcli_telnet_server_t *server) {
         return;
     }
 
-    server->running = false;
-    embcli_telnet_wake_listener(server);
-    pthread_join(server->accept_thread, NULL);
-    shutdown(server->listen_fd, SHUT_RDWR);
-    close(server->listen_fd);
-    server->listen_fd = -1;
+    embcli_telnet_stop_accept_loop(server);
+}
+
+int embcli_telnet_server_rebind(embcli_telnet_server_t *server, const char *bind_address) {
+    char previous_bind_address[sizeof(server->bind_address_storage)];
+
+    if (server == NULL || !embcli_telnet_validate_bind_address(bind_address)) {
+        return -1;
+    }
+
+    snprintf(
+        previous_bind_address,
+        sizeof(previous_bind_address),
+        "%s",
+        server->config.bind_address != NULL ? server->config.bind_address : "0.0.0.0");
+
+    if (!server->running) {
+        return embcli_telnet_store_bind_address(server, bind_address) ? 0 : -1;
+    }
+
+    embcli_telnet_stop_accept_loop(server);
+
+    if (!embcli_telnet_store_bind_address(server, bind_address) ||
+        embcli_telnet_start_accept_loop(server) != 0) {
+        (void)embcli_telnet_store_bind_address(server, previous_bind_address);
+        if (embcli_telnet_start_accept_loop(server) != 0) {
+            server->running = false;
+            server->listen_fd = -1;
+        }
+        return -1;
+    }
+
+    return 0;
 }
 
 bool embcli_telnet_server_is_running(embcli_telnet_server_t *server) {
@@ -1173,4 +1257,12 @@ int embcli_telnet_server_active_clients(embcli_telnet_server_t *server) {
     active = server->active_clients;
     pthread_mutex_unlock(&server->lock);
     return active;
+}
+
+const char *embcli_telnet_server_bind_address(embcli_telnet_server_t *server) {
+    if (server == NULL) {
+        return NULL;
+    }
+
+    return server->config.bind_address;
 }
