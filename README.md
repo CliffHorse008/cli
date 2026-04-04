@@ -9,6 +9,7 @@
 - 对外接口简单，支持静态宏定义或运行时函数注册
 - 参数类型较丰富
 - 命令帮助、用法说明、参数校验、布尔/枚举解析
+- `system/thread-cpu` 支持按采样窗口输出当前进程各线程 `USR/SYS/CPU%`，支持排序和线程名过滤，效果类似简化版 `pidstat -t`
 - `Tab` 自动补全并显示候选的 `usage/summary`，命令参数支持 `ENUM/BOOL` 级补全，其它类型给出参数提示，支持 `↑/↓` 历史命令浏览和 `←/→` 行内光标移动
 
 当前参数类型包括：
@@ -55,6 +56,15 @@ cmake --build build
 
 ```bash
 telnet 127.0.0.1 2323
+```
+
+示例线程 CPU 采样：
+
+```text
+board> system/thread-cpu 200 8 cpu embcli
+thread cpu sample: interval=200ms thread-count=4 sort=cpu filter=embcli
+  TID       USR%   SYS%   CPU%    TICKS   NAME
+  12345      4.50   0.50   5.00       1 embcli_demo
 ```
 
 自动化演示和压力测试：

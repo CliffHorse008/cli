@@ -1079,6 +1079,37 @@ static bool test_parameters_and_errors(uint16_t port) {
            demo_expect_contains(output, "unknown command: unknown-command", "unknown command");
 }
 
+static bool test_thread_cpu_sampling(uint16_t port) {
+    int fd;
+    char output[DEMO_FEATURE_MAX];
+
+    if (!demo_open_session(port, &fd, output, sizeof(output))) {
+        return false;
+    }
+
+    if (!demo_send_line(fd, "system/thread-cpu 100 4 cpu embcli") ||
+        !demo_send_line(fd, "exit")) {
+        close(fd);
+        return false;
+    }
+
+    if (demo_recv_quiet(fd, output, sizeof(output), 5000, 300) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    return demo_expect_contains(output, "thread cpu sample: interval=100ms", "thread cpu header") &&
+           demo_expect_contains(output, "thread-count=", "thread cpu count") &&
+           demo_expect_contains(output, "sort=cpu", "thread cpu sort") &&
+           demo_expect_contains(output, "filter=embcli", "thread cpu filter") &&
+           demo_expect_contains(output, "TID", "thread cpu columns tid") &&
+           demo_expect_contains(output, "USR%", "thread cpu columns user") &&
+           demo_expect_contains(output, "SYS%", "thread cpu columns system") &&
+           demo_expect_contains(output, "CPU%", "thread cpu columns cpu") &&
+           demo_expect_contains(output, "NAME", "thread cpu columns name");
+}
+
 static bool run_parser_interface_tests(void) {
     parser_test_fixture_t fixture;
     char long_line[700];
@@ -1284,6 +1315,7 @@ static bool run_feature_demo(uint16_t port) {
         { "path-execution", test_path_execution },
         { "input-boundaries", test_input_boundaries },
         { "parameters-and-errors", test_parameters_and_errors },
+        { "thread-cpu-sampling", test_thread_cpu_sampling },
         { "completion-and-history", test_completion_and_history },
         { "inline-cursor-editing", test_inline_cursor_editing }
     };
