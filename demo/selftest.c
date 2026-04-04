@@ -374,6 +374,93 @@ static ssize_t demo_recv_raw_quiet(
     return (ssize_t)length;
 }
 
+static bool demo_contains_all_needles(
+    const char *buffer,
+    const char *const *needles,
+    size_t needle_count) {
+    if (buffer == NULL) {
+        return false;
+    }
+
+    for (size_t index = 0; index < needle_count; ++index) {
+        if (needles[index] == NULL) {
+            continue;
+        }
+        if (strstr(buffer, needles[index]) == NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static ssize_t demo_recv_until_contains(
+    int fd,
+    char *buffer,
+    size_t capacity,
+    int total_timeout_ms,
+    int quiet_timeout_ms,
+    const char *const *needles,
+    size_t needle_count,
+    bool *matched_out) {
+    demo_filter_state_t state;
+    size_t length = 0;
+    int elapsed_ms = 0;
+    int idle_ms = 0;
+    bool seen_data = false;
+    bool matched = false;
+
+    memset(&state, 0, sizeof(state));
+    if (capacity > 0) {
+        buffer[0] = '\0';
+    }
+
+    while (elapsed_ms < total_timeout_ms) {
+        fd_set readfds;
+        struct timeval tv;
+        int ready;
+        unsigned char raw[1024];
+        ssize_t received;
+
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+
+        ready = select(fd + 1, &readfds, NULL, NULL, &tv);
+        elapsed_ms += 100;
+
+        if (ready < 0) {
+            return -1;
+        }
+        if (ready == 0) {
+            if (seen_data) {
+                idle_ms += 100;
+                if (matched && idle_ms >= quiet_timeout_ms) {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        received = recv(fd, raw, sizeof(raw), 0);
+        if (received <= 0) {
+            break;
+        }
+
+        seen_data = true;
+        idle_ms = 0;
+        demo_filter_bytes(&state, raw, (size_t)received, buffer, capacity, &length);
+        if (!matched) {
+            matched = demo_contains_all_needles(buffer, needles, needle_count);
+        }
+    }
+
+    if (matched_out != NULL) {
+        *matched_out = matched;
+    }
+    return (ssize_t)length;
+}
+
 static int demo_count_occurrence(const char *haystack, const char *needle) {
     int count = 0;
     const char *cursor = haystack;
@@ -1288,8 +1375,21 @@ static void *run_stress_worker(void *arg) {
     stress_worker_args_t *worker = (stress_worker_args_t *)arg;
     int fd = -1;
     char banner[4096];
-    char script[4096];
+    char system_script[1024];
+    char device_script[512];
+    char network_script[1024];
     char output[16384];
+    static const char *const system_expected[] = {
+        "log level => info",
+        "reboot scheduled:"
+    };
+    static const char *const device_expected[] = {
+        "led["
+    };
+    static const char *const network_expected[] = {
+        "network =>",
+        "demo-fw 1.0.0"
+    };
 
     worker->ok = false;
     worker->error[0] = '\0';
@@ -1302,44 +1402,100 @@ static void *run_stress_worker(void *arg) {
     /* 每个 worker 都像一个独立操作者，拥有自己的会话。 */
     for (int index = 0; index < worker->loops; ++index) {
         int led_id = (worker->worker_id + index) % 8;
+        bool matched = false;
         snprintf(
-            script,
-            sizeof(script),
+            system_script,
+            sizeof(system_script),
             "system\r"
             "log-level info\r"
             "reboot %d worker-%d-step-%d\r"
-            "back\r"
+            "back\r",
+            (index % 20) + 1,
+            worker->worker_id,
+            index);
+
+        snprintf(
+            device_script,
+            sizeof(device_script),
             "device\r"
             "set %d off true\r"
-            "back\r"
+            "back\r",
+            led_id);
+
+        snprintf(
+            network_script,
+            sizeof(network_script),
             "network\r"
             "config 10.%d.%d.%d 255.255.0.0 10.%d.0.1\r"
             "back\r"
             "version\r",
-            (index % 20) + 1,
-            worker->worker_id,
-            index,
-            led_id,
             worker->worker_id,
             index % 250,
             led_id + 1,
             worker->worker_id);
 
-        if (!demo_send_all(fd, script, strlen(script))) {
-            snprintf(worker->error, sizeof(worker->error), "send failed");
+        if (!demo_send_all(fd, system_script, strlen(system_script))) {
+            snprintf(worker->error, sizeof(worker->error), "system send failed");
             goto cleanup;
         }
-        if (demo_recv_raw_quiet(fd, output, sizeof(output), 5000, 250) < 0) {
-            snprintf(worker->error, sizeof(worker->error), "recv failed");
+        if (demo_recv_until_contains(
+                fd,
+                output,
+                sizeof(output),
+                5000,
+                250,
+                system_expected,
+                sizeof(system_expected) / sizeof(system_expected[0]),
+                &matched) < 0) {
+            snprintf(worker->error, sizeof(worker->error), "system recv failed");
+            goto cleanup;
+        }
+        if (!matched) {
+            snprintf(worker->error, sizeof(worker->error), "unexpected system output in loop %d", index);
             goto cleanup;
         }
 
-        if (strstr(output, "log level => info") == NULL ||
-            strstr(output, "reboot scheduled:") == NULL ||
-            strstr(output, "network =>") == NULL ||
-            strstr(output, "led[") == NULL ||
-            strstr(output, "demo-fw 1.0.0") == NULL) {
-            snprintf(worker->error, sizeof(worker->error), "unexpected output in loop %d", index);
+        matched = false;
+        if (!demo_send_all(fd, device_script, strlen(device_script))) {
+            snprintf(worker->error, sizeof(worker->error), "device send failed");
+            goto cleanup;
+        }
+        if (demo_recv_until_contains(
+                fd,
+                output,
+                sizeof(output),
+                5000,
+                250,
+                device_expected,
+                sizeof(device_expected) / sizeof(device_expected[0]),
+                &matched) < 0) {
+            snprintf(worker->error, sizeof(worker->error), "device recv failed");
+            goto cleanup;
+        }
+        if (!matched) {
+            snprintf(worker->error, sizeof(worker->error), "unexpected device output in loop %d", index);
+            goto cleanup;
+        }
+
+        matched = false;
+        if (!demo_send_all(fd, network_script, strlen(network_script))) {
+            snprintf(worker->error, sizeof(worker->error), "network send failed");
+            goto cleanup;
+        }
+        if (demo_recv_until_contains(
+                fd,
+                output,
+                sizeof(output),
+                5000,
+                250,
+                network_expected,
+                sizeof(network_expected) / sizeof(network_expected[0]),
+                &matched) < 0) {
+            snprintf(worker->error, sizeof(worker->error), "network recv failed");
+            goto cleanup;
+        }
+        if (!matched) {
+            snprintf(worker->error, sizeof(worker->error), "unexpected network output in loop %d", index);
             goto cleanup;
         }
     }
