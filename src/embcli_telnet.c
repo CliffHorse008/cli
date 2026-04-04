@@ -48,7 +48,7 @@ typedef enum embcli_telnet_state {
     EMBCLI_TELNET_SB_IAC
 } embcli_telnet_state_t;
 
-/* 仅跟踪最小范围的 ANSI 转义序列，用于方向键历史导航。 */
+/* 仅跟踪最小范围的 ANSI 转义序列，用于方向键和行内编辑。 */
 typedef enum embcli_ansi_state {
     EMBCLI_ANSI_NONE = 0,
     EMBCLI_ANSI_ESC,
@@ -58,12 +58,14 @@ typedef enum embcli_ansi_state {
 /*
  * 每个客户端各自拥有一份行编辑状态。
  * - `line`: 当前可见的命令行内容
+ * - `cursor_pos`: 当前插入点所在的逻辑列
  * - `scratch`: 浏览历史时暂存的未提交输入
  * - `history`: 用紧凑数组实现的有界历史记录
  */
 typedef struct embcli_telnet_editor {
     char line[EMBCLI_TELNET_LINE_MAX];
     size_t line_len;
+    size_t cursor_pos;
     char scratch[EMBCLI_TELNET_LINE_MAX];
     bool scratch_valid;
     char history[EMBCLI_TELNET_HISTORY_MAX][EMBCLI_TELNET_LINE_MAX];
@@ -227,11 +229,25 @@ static void embcli_telnet_redraw_line(
     embcli_session_t *session,
     const embcli_telnet_editor_t *editor) {
     char prompt[128];
-    char buffer[EMBCLI_TELNET_LINE_MAX + 192];
+    char buffer[EMBCLI_TELNET_LINE_MAX + 224];
+    size_t cursor_back = 0;
 
-    /* 每次重绘都完整重写 prompt+line，并清掉尾部残留字符。 */
+    /* 每次重绘都完整重写 prompt+line，并把终端光标恢复到逻辑插入点。 */
     embcli_session_format_prompt(session, prompt, sizeof(prompt));
-    snprintf(buffer, sizeof(buffer), "\r%s> %s\033[K", prompt, editor->line);
+    if (editor->cursor_pos <= editor->line_len) {
+        cursor_back = editor->line_len - editor->cursor_pos;
+    }
+    if (cursor_back > 0) {
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "\r%s> %s\033[K\033[%zuD",
+            prompt,
+            editor->line,
+            cursor_back);
+    } else {
+        snprintf(buffer, sizeof(buffer), "\r%s> %s\033[K", prompt, editor->line);
+    }
     embcli_telnet_send_text(socket_fd, buffer);
 }
 
@@ -245,6 +261,23 @@ static void embcli_telnet_editor_set_line(
     const char *text) {
     snprintf(editor->line, sizeof(editor->line), "%s", text != NULL ? text : "");
     editor->line_len = strlen(editor->line);
+    editor->cursor_pos = editor->line_len;
+}
+
+static bool embcli_telnet_editor_move_left(embcli_telnet_editor_t *editor) {
+    if (editor->cursor_pos == 0) {
+        return false;
+    }
+    --editor->cursor_pos;
+    return true;
+}
+
+static bool embcli_telnet_editor_move_right(embcli_telnet_editor_t *editor) {
+    if (editor->cursor_pos >= editor->line_len) {
+        return false;
+    }
+    ++editor->cursor_pos;
+    return true;
 }
 
 static void embcli_telnet_editor_add_history(
@@ -662,22 +695,32 @@ static size_t embcli_telnet_common_prefix_length(
 static void embcli_telnet_replace_suffix(
     embcli_telnet_editor_t *editor,
     size_t token_begin,
+    size_t token_end,
     const char *replacement,
     bool append_space) {
     size_t base_len = token_begin;
     size_t replacement_len = strlen(replacement);
-    size_t total_len = base_len + replacement_len + (append_space ? 1U : 0U);
+    size_t suffix_len = editor->line_len - token_end;
+    size_t total_len = base_len + replacement_len + suffix_len + (append_space ? 1U : 0U);
 
     if (total_len >= sizeof(editor->line)) {
         return;
     }
 
     memcpy(editor->line + base_len, replacement, replacement_len);
+    if (suffix_len > 0) {
+        memmove(
+            editor->line + base_len + replacement_len + (append_space ? 1U : 0U),
+            editor->line + token_end,
+            suffix_len);
+    }
     editor->line_len = base_len + replacement_len;
     if (append_space) {
         editor->line[editor->line_len++] = ' ';
     }
+    editor->line_len += suffix_len;
     editor->line[editor->line_len] = '\0';
+    editor->cursor_pos = base_len + replacement_len + (append_space ? 1U : 0U);
 }
 
 static void embcli_telnet_print_completion_list(
@@ -718,14 +761,16 @@ static void embcli_telnet_editor_autocomplete(
     char first_token[EMBCLI_TELNET_LINE_MAX];
     const char *first_token_view = NULL;
     size_t token_begin = 0;
+    size_t token_end = 0;
     size_t token_index = 0;
     char prefix[EMBCLI_TELNET_LINE_MAX];
     size_t prefix_len = 0;
-    bool in_token = false;
+    size_t cursor = editor->cursor_pos;
+    bool has_first_token = false;
 
     /*
      * 补全逻辑以 token 为单位工作。
-     * 先根据当前行尾判断光标正位于哪个 token，再按该 token 位置收集对应候选。
+     * 先根据当前光标定位活跃 token，再按该 token 位置收集对应候选。
      */
     if (editor->line_len == 0) {
         embcli_telnet_collect_completion_matches(session, 0, NULL, "", &result);
@@ -733,37 +778,63 @@ static void embcli_telnet_editor_autocomplete(
         return;
     }
 
-    for (size_t index = 0; index < editor->line_len; ++index) {
-        if (editor->line[index] != ' ') {
-            if (!in_token) {
-                if (token_index == 0) {
-                    size_t first_len = 0;
-                    while (index + first_len < editor->line_len &&
-                           editor->line[index + first_len] != ' ') {
-                        ++first_len;
-                    }
-                    snprintf(first_token, sizeof(first_token), "%.*s", (int)first_len, editor->line + index);
-                    first_token_view = first_token;
-                }
-                in_token = true;
-                token_begin = index;
-            }
-        } else {
-            if (in_token) {
-                in_token = false;
-                ++token_index;
-            }
+    if (cursor > editor->line_len) {
+        cursor = editor->line_len;
+    }
+
+    for (size_t index = 0; index < editor->line_len;) {
+        while (index < editor->line_len && editor->line[index] == ' ') {
+            ++index;
         }
+        if (index >= editor->line_len) {
+            break;
+        }
+
+        size_t begin = index;
+        while (index < editor->line_len && editor->line[index] != ' ') {
+            ++index;
+        }
+        size_t end = index;
+
+        if (!has_first_token) {
+            snprintf(first_token, sizeof(first_token), "%.*s", (int)(end - begin), editor->line + begin);
+            first_token_view = first_token;
+            has_first_token = true;
+        }
+
+        if (cursor < begin) {
+            break;
+        }
+        if (cursor <= end) {
+            token_begin = begin;
+            token_end = end;
+            break;
+        }
+
+        ++token_index;
     }
 
-    if (!in_token) {
-        token_begin = editor->line_len;
-    } else if (strchr(editor->line, ' ') == NULL) {
-        token_begin = 0;
+    if (token_end == 0 && (cursor == editor->line_len || editor->line[cursor] == ' ')) {
+        token_begin = cursor;
+        token_end = cursor;
     }
 
-    snprintf(prefix, sizeof(prefix), "%s", editor->line + token_begin);
-    prefix_len = strlen(prefix);
+    while (token_begin > 0 && editor->line[token_begin - 1] != ' ') {
+        --token_begin;
+    }
+    while (token_end < editor->line_len && editor->line[token_end] != ' ') {
+        ++token_end;
+    }
+
+    if (cursor < token_begin) {
+        cursor = token_begin;
+    }
+    if (cursor > token_end) {
+        cursor = token_end;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%.*s", (int)(cursor - token_begin), editor->line + token_begin);
+    prefix_len = cursor - token_begin;
 
     embcli_telnet_collect_completion_matches(session, token_index, first_token_view, prefix, &result);
 
@@ -778,7 +849,7 @@ static void embcli_telnet_editor_autocomplete(
     }
 
     if (result.match_count == 1) {
-        embcli_telnet_replace_suffix(editor, token_begin, result.matches[0].name, true);
+        embcli_telnet_replace_suffix(editor, token_begin, token_end, result.matches[0].name, true);
         embcli_telnet_redraw_line(socket_fd, session, editor);
         return;
     }
@@ -787,7 +858,7 @@ static void embcli_telnet_editor_autocomplete(
     if (common_len > prefix_len) {
         char partial[EMBCLI_TELNET_LINE_MAX];
         snprintf(partial, sizeof(partial), "%.*s", (int)common_len, result.matches[0].name);
-        embcli_telnet_replace_suffix(editor, token_begin, partial, false);
+        embcli_telnet_replace_suffix(editor, token_begin, token_end, partial, false);
         embcli_telnet_redraw_line(socket_fd, session, editor);
         return;
     }
@@ -820,16 +891,15 @@ static bool embcli_telnet_handle_char(
     int socket_fd,
     embcli_session_t *session,
     embcli_telnet_editor_t *editor,
-    char *line,
-    size_t *line_len,
     unsigned char byte) {
-    (void)line;
-    (void)line_len;
-
     if (byte == 0x08 || byte == 0x7f) {
-        if (editor->line_len > 0) {
+        if (editor->cursor_pos > 0) {
+            memmove(
+                editor->line + editor->cursor_pos - 1,
+                editor->line + editor->cursor_pos,
+                editor->line_len - editor->cursor_pos + 1);
+            --editor->cursor_pos;
             --editor->line_len;
-            editor->line[editor->line_len] = '\0';
             embcli_telnet_editor_reset_navigation(editor);
             embcli_telnet_redraw_line(socket_fd, session, editor);
         } else {
@@ -850,14 +920,20 @@ static bool embcli_telnet_handle_char(
     if (editor->line_len + 1 >= EMBCLI_TELNET_LINE_MAX) {
         embcli_telnet_send_text(socket_fd, "\r\ninput too long\r\n");
         editor->line_len = 0;
+        editor->cursor_pos = 0;
         editor->line[0] = '\0';
         embcli_telnet_editor_reset_navigation(editor);
         embcli_telnet_redraw_line(socket_fd, session, editor);
         return true;
     }
 
-    editor->line[editor->line_len++] = (char)byte;
-    editor->line[editor->line_len] = '\0';
+    memmove(
+        editor->line + editor->cursor_pos + 1,
+        editor->line + editor->cursor_pos,
+        editor->line_len - editor->cursor_pos + 1);
+    editor->line[editor->cursor_pos] = (char)byte;
+    ++editor->cursor_pos;
+    ++editor->line_len;
     embcli_telnet_editor_reset_navigation(editor);
     embcli_telnet_redraw_line(socket_fd, session, editor);
     return false;
@@ -919,6 +995,18 @@ static void *embcli_telnet_client_thread(void *arg) {
                         embcli_telnet_editor_history_up(client->socket_fd, &session, &editor);
                     } else if (byte == 'B') {
                         embcli_telnet_editor_history_down(client->socket_fd, &session, &editor);
+                    } else if (byte == 'C') {
+                        if (embcli_telnet_editor_move_right(&editor)) {
+                            embcli_telnet_redraw_line(client->socket_fd, &session, &editor);
+                        } else {
+                            embcli_telnet_send_bell(client->socket_fd);
+                        }
+                    } else if (byte == 'D') {
+                        if (embcli_telnet_editor_move_left(&editor)) {
+                            embcli_telnet_redraw_line(client->socket_fd, &session, &editor);
+                        } else {
+                            embcli_telnet_send_bell(client->socket_fd);
+                        }
                     }
                     continue;
                 }
@@ -949,8 +1037,6 @@ static void *embcli_telnet_client_thread(void *arg) {
                     client->socket_fd,
                     &session,
                     &editor,
-                    editor.line,
-                    &editor.line_len,
                     byte);
                 break;
             case EMBCLI_TELNET_IAC:

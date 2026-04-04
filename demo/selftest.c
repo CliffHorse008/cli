@@ -1155,6 +1155,37 @@ static bool test_completion_and_history(uint16_t port) {
            demo_expect_contains(output, "led[1] => on=false blink=false", "bool completion execution");
 }
 
+static bool test_inline_cursor_editing(uint16_t port) {
+    int fd;
+    char output[DEMO_FEATURE_MAX];
+    /*
+     * 这段脚本覆盖：
+     * - 左箭头把光标移回中间位置
+     * - 右箭头把光标向前恢复
+     * - 在行中间插入字符后再执行命令
+     */
+    static const char script[] =
+        "verion\x1b[D\x1b[D\x1b[Ds\r"
+        "verson\x1b[D\x1b[D\x1b[D\x1b[Ci\r"
+        "exit\r";
+
+    if (!demo_open_session(port, &fd, output, sizeof(output))) {
+        return false;
+    }
+    if (!demo_send_all(fd, script, sizeof(script) - 1U)) {
+        close(fd);
+        return false;
+    }
+
+    if (demo_recv_quiet(fd, output, sizeof(output), 4000, 250) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    return demo_count_occurrence(output, "demo-fw 1.0.0") >= 2;
+}
+
 static bool run_feature_demo(uint16_t port) {
     struct {
         const char *name;
@@ -1166,7 +1197,8 @@ static bool run_feature_demo(uint16_t port) {
         { "path-execution", test_path_execution },
         { "input-boundaries", test_input_boundaries },
         { "parameters-and-errors", test_parameters_and_errors },
-        { "completion-and-history", test_completion_and_history }
+        { "completion-and-history", test_completion_and_history },
+        { "inline-cursor-editing", test_inline_cursor_editing }
     };
 
     /* 固定顺序执行功能测试，便于在失败时直接定位阶段。 */
