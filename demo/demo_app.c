@@ -619,9 +619,8 @@ void build_demo_cli(embcli_t *cli, embcli_telnet_server_t *server) {
 
     /*
      * 这些对象保留为 static，以贴近嵌入式固件常见的内存布局。
-     * 但每次 build 都会重新 init，确保 selftest 能在同一进程里多次启停 demo server。
+     * CLI 根对象由调用方负责初始化，这样全局场景可直接使用 EMBCLI_GLOBAL_DEF。
      */
-    embcli_init(cli, "board", "Embedded CLI demo over telnet");
     telnet_ctx.server = server;
     embcli_menu_init(&system_menu, "system", "system control and logging");
     embcli_menu_init(&network_menu, "network", "network configuration");

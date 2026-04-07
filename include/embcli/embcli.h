@@ -126,6 +126,18 @@ struct embcli_session {
 };
 
 /* 面向静态注册风格的便捷宏。 */
+#define EMBCLI_GLOBAL_DEF(var_name, cli_name, cli_banner) \
+    embcli_t var_name = { \
+        .name = (cli_name), \
+        .banner = (cli_banner), \
+        .tree_lock = PTHREAD_RWLOCK_INITIALIZER, \
+        .root_menu = { \
+            .name = "", \
+            .summary = "root", \
+            .owner = &(var_name), \
+        }, \
+    }
+
 #define EMBCLI_ARG_STRING_REQ(name, help_text) \
     { (name), EMBCLI_ARG_STRING, false, (help_text), 0, 0, 0, 0, NULL, 0 }
 #define EMBCLI_ARG_STRING_OPT(name, help_text) \
@@ -165,7 +177,7 @@ struct embcli_session {
 #define EMBCLI_MENU_DEF(menu_name, menu_summary) \
     { (menu_name), (menu_summary), NULL, NULL, NULL, NULL, NULL }
 
-/* 初始化 CLI 根对象以及隐含的 root 菜单。 */
+/* 初始化 CLI 根对象以及隐含的 root 菜单。全局静态对象可改用 EMBCLI_GLOBAL_DEF。 */
 void embcli_init(embcli_t *cli, const char *name, const char *banner);
 /* 释放 CLI 内部资源。若对象会反复 init/deinit，建议显式调用。 */
 void embcli_deinit(embcli_t *cli);

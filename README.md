@@ -115,6 +115,7 @@ static void cmd_log_level(
 ### 3. 定义命令和菜单
 
 ```c
+static EMBCLI_GLOBAL_DEF(cli, "board", "Embedded CLI demo over telnet");
 static embcli_menu_t system_menu = EMBCLI_MENU_DEF("system", "system control");
 static embcli_command_t cmd_log =
     EMBCLI_COMMAND_DEF("log-level", "set log level", log_args, cmd_log_level, NULL);
@@ -122,6 +123,8 @@ static embcli_command_t cmd_log =
 embcli_menu_add_menu(embcli_root_menu(&cli), &system_menu);
 embcli_menu_add_command(&system_menu, &cmd_log);
 ```
+
+如果 `embcli_t` 不是全局静态对象，而是栈变量或结构体成员，仍然使用 `embcli_init(&cli, name, banner)`。
 
 ### 4. 启动 telnet server
 

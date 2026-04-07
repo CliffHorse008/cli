@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop = 0;
+static EMBCLI_GLOBAL_DEF(g_cli, "board", "Embedded CLI demo over telnet");
 
 static void demo_handle_signal(int signo) {
     (void)signo;
@@ -31,7 +32,6 @@ static uint16_t parse_port_or_default(const char *text, uint16_t fallback) {
 }
 
 int main(int argc, char **argv) {
-    embcli_t cli;
     embcli_telnet_server_t server;
     embcli_telnet_config_t config;
     const char *bind_address = "127.0.0.1";
@@ -44,9 +44,9 @@ int main(int argc, char **argv) {
         bind_address = argv[2];
     }
 
-    build_demo_cli(&cli, &server);
+    build_demo_cli(&g_cli, &server);
 
-    config.cli = &cli;
+    config.cli = &g_cli;
     config.bind_address = bind_address;
     config.port = port;
     config.backlog = 4;
@@ -69,6 +69,6 @@ int main(int argc, char **argv) {
     }
 
     embcli_telnet_server_stop(&server);
-    embcli_deinit(&cli);
+    embcli_deinit(&g_cli);
     return 0;
 }

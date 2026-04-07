@@ -772,6 +772,7 @@ static bool demo_start_server(demo_server_ctx_t *ctx, uint16_t port, int max_cli
     embcli_telnet_config_t config;
 
     memset(ctx, 0, sizeof(*ctx));
+    embcli_init(&ctx->cli, "board", "Embedded CLI demo over telnet");
     build_demo_cli(&ctx->cli, &ctx->server);
 
     ctx->port = port;
